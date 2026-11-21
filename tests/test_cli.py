@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from pve_ci_runners import cli
-from pve_ci_runners._version import VERSION
 from pve_ci_runners.config import parse
 from pve_ci_runners.doctor import Finding
 from pve_ci_runners.drain import draining
@@ -63,7 +62,7 @@ def test_config_check_drain_resume_and_version(config_file: Path, capsys: pytest
     assert cli.main(["-c", str(config_file), "resume"]) == 0
     assert not draining(config_file.parent / "state")
     assert cli.main(["version"]) == 0
-    assert capsys.readouterr().out.strip().endswith(VERSION)
+    assert capsys.readouterr().out.strip().endswith(cli.VERSION)
 
 
 def test_errors_are_one_line_and_a_non_zero_exit(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
