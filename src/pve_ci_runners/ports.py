@@ -49,6 +49,10 @@ class Hypervisor(Protocol):
         """Boots a VM."""
         ...
 
+    def protect(self, vmid: int) -> None:
+        """Makes a running VM the kernel's first out-of-memory victim."""
+        ...
+
     def destroy(self, vmid: int) -> None:
         """Removes a VM."""
         ...

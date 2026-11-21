@@ -14,7 +14,7 @@ from pve_ci_runners.actions import QueuedJob
 from pve_ci_runners.cache import CacheBackend
 from pve_ci_runners.capacity import HostMemory, vms_that_fit
 from pve_ci_runners.config import Config, Profile, Slot
-from pve_ci_runners.drain import draining
+from pve_ci_runners.drain import draining, memory_lock, reserved_mb
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.guest import payload_version
 from pve_ci_runners.lifecycle import IsolationError, Lifecycle
@@ -131,7 +131,11 @@ class Controller:
         result: dict[int, VmState] = {}
         for vmid, state in states.items():
             try:
-                kept = self._advance_one(self._slots[vmid], state, repositories, now)
+                kept = (
+                    self._advance_one(self._slots[vmid], state, repositories, now)
+                    if self._protected(vmid, state, repositories)
+                    else None
+                )
             except IsolationError as err:
                 self.blocked = str(err)
                 log.error("%s", err)  # noqa: TRY400 - the reason is the message; a traceback adds nothing
@@ -149,12 +153,31 @@ class Controller:
         vmid = slot.vmid
         if state.phase == "booting":
             return self._advance_booting(slot, state, now)
-        if state.phase == "warm" and state.payload != payload_version():
+        # Draining gives idle VMs' memory back, so maintenance such as a template build gets room.
+        if state.phase == "warm" and (
+            state.payload != payload_version() or draining(self._config.daemon.state_dir)
+        ):
             self._lifecycle.retire(vmid, state, repositories)
             return None
         if state.phase == "assigned":
             return self._advance_assigned(vmid, state, repositories, now)
         return state
+
+    def _protected(self, vmid: int, state: VmState, repositories: dict[str, str]) -> bool:
+        """Whether a running VM is the kernel's first out-of-memory victim; one that cannot be is removed.
+
+        Enforced every cycle: a VM restarted outside the controller, for example by a backup job in stop
+        mode or after a host reboot, runs in a new QEMU process with the default priority.
+        """
+        if not state.running:
+            return True
+        try:
+            self._pve.protect(vmid)
+        except PveCiError as err:
+            log.warning("VM %s is removed: %s", vmid, err)
+            _guarded(vmid, partial(self._lifecycle.retire, vmid, state, repositories))
+            return False
+        return True
 
     def _advance_assigned(
         self, vmid: int, state: VmState, repositories: dict[str, str], now: float
@@ -245,7 +268,7 @@ class Controller:
     def _fits(self, host: HostMemory, budget_left: int, profile: Profile) -> int:
         return vms_that_fit(
             host,
-            reserve_mb=self._config.capacity.host_reserve_mb,
+            reserve_mb=self._config.capacity.host_reserve_mb + reserved_mb(self._config.daemon.state_dir),
             budget_left_mb=budget_left,
             vm_mb=profile.memory_mb,
         )
@@ -269,17 +292,18 @@ class Controller:
         self._create(creations, template[0], infos)
 
     def _create(self, creations: list[tuple[str, int]], template: int, infos: dict[int, VmInfo]) -> None:
-        host = self._pve.host_memory()
-        budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
-        committed = host.committed_mb
-        for name, vmid in creations:
-            profile = self._config.profile(name)
-            if self._fits(HostMemory(host.total_mb, committed), budget_left, profile) < 1:
-                log.info("not starting VM %s: the host keeps its reserve for other guests", vmid)
-                return
-            if _guarded(vmid, partial(self._lifecycle.create, self._slots[vmid], profile, template)):
-                budget_left -= profile.memory_mb
-                committed += profile.memory_mb
+        with memory_lock(self._config.daemon.state_dir):
+            host = self._pve.host_memory()
+            budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
+            committed = host.committed_mb
+            for name, vmid in creations:
+                profile = self._config.profile(name)
+                if self._fits(HostMemory(host.total_mb, committed), budget_left, profile) < 1:
+                    log.info("not starting VM %s: the host keeps its reserve for other guests", vmid)
+                    return
+                if _guarded(vmid, partial(self._lifecycle.create, self._slots[vmid], profile, template)):
+                    budget_left -= profile.memory_mb
+                    committed += profile.memory_mb
 
     def _update_overflow(self, plans: dict[str, Plan], demand: _Demand, now: float) -> None:
         if self._overflow is None:

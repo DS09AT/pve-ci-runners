@@ -62,7 +62,9 @@ def _parser() -> argparse.ArgumentParser:
     template_commands.add_parser("build", help="build the next runner template").set_defaults(
         handler=_build_template
     )
-    commands.add_parser("drain", help="take no new jobs; running jobs finish").set_defaults(handler=_drain)
+    commands.add_parser(
+        "drain", help="take no new jobs and release idle VMs; running jobs finish"
+    ).set_defaults(handler=_drain)
     commands.add_parser("resume", help="take new jobs again").set_defaults(handler=_resume)
     commands.add_parser("version", help="print the version").set_defaults(handler=_version)
     return parser
@@ -83,7 +85,7 @@ def _status(args: argparse.Namespace) -> int:
 
 def _drain(args: argparse.Namespace) -> int:
     drain(configuration.load(args.config).daemon.state_dir)
-    print("draining: no new jobs are taken, running jobs finish")
+    print("draining: no new jobs are taken, idle VMs are released, running jobs finish")
     return 0
 
 

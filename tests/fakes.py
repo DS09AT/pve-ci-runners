@@ -1,5 +1,6 @@
 """In-memory stand-ins for the hypervisor, GitHub and the cache, close enough to drive the controller."""
 
+import fcntl
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,8 @@ class FakeHost:
         self.addresses: tuple[str, ...] = ("192.168.100.1", "203.0.113.10")
         self.datacenter_firewall = True
         self.uncreatable: set[int] = set()
+        self.protected: set[int] = set()
+        self.unprotectable: set[int] = set()
 
     def add_template(self, vmid: int, built_at: int = 100) -> None:
         marker = TemplateMarker(built_at=built_at, runner_version="2.338.2").encode()
@@ -103,7 +106,13 @@ class FakeHost:
     def start(self, vmid: int) -> None:
         assert vmid in self.firewall, "a VM must never boot before its firewall file is written"
         self.machines[vmid].running = True
+        self.protected.add(vmid)
         self.events.append(f"start {vmid}")
+
+    def protect(self, vmid: int) -> None:
+        if vmid in self.unprotectable:
+            raise CommandError(f"VM {vmid}: its out-of-memory priority could not be set")
+        self.protected.add(vmid)
 
     def destroy(self, vmid: int) -> None:
         if vmid in self.undestroyable:
@@ -285,3 +294,14 @@ class Script:
 
 def done(stdout: object = "", code: int = 0, stderr: str = "") -> Completed:
     return Completed(code, stdout if isinstance(stdout, str) else json.dumps(stdout), stderr)
+
+
+def holds_memory_lock(state_dir: Path) -> bool:
+    """Whether someone holds the lock that serialises memory checks with VM starts."""
+    with (state_dir / "memory.lock").open("w", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False

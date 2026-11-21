@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from pve_ci_runners.config import Config, check_secret_file
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.ports import GitHubApp, Hypervisor
-from pve_ci_runners.proc import Commands, output
+from pve_ci_runners.proc import Commands, output, succeeds
 from pve_ci_runners.pve import TAG, datacenter_firewall_enabled
 from pve_ci_runners.templates import current_template
 
@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 Level = Literal["ok", "warn", "fail"]
 _LEVELS = {"read": 1, "write": 2, "admin": 3}
 _LINKED_CLONE_TYPES = frozenset({"zfspool", "lvmthin", "rbd"})
+# What Proxmox VE itself needs besides the guests and the ZFS ARC.
+_HOST_MB = 1024
+_ZFS_KSTAT = "/proc/spl/kstat/zfs"
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class Doctor:
             ("bridge", self._bridge),
             ("forwarding", self._forwarding),
             ("outbound NAT", self._nat),
+            ("memory reserve", self._reserve),
             ("template storage", self._template_storage),
             ("snippet storage", self._snippet_storage),
             ("cache dataset", self._dataset),
@@ -127,6 +131,22 @@ class Doctor:
             "outbound NAT",
             f"no masquerade or snat rule for {network} found in nftables",
             f"add a post-up rule for {network} to the bridge in /etc/network/interfaces",
+        )
+
+    def _reserve(self) -> Finding:
+        if not succeeds(self._commands, ["test", "-d", _ZFS_KSTAT], timeout=30):
+            return Finding("ok", "memory reserve", "no ZFS on this host")
+        arc = _arc_max(output(self._commands, ["cat", f"{_ZFS_KSTAT}/arcstats"], timeout=30))
+        # The ARC gives memory back under pressure, but not fast enough to save a guest from the OOM killer.
+        needed = arc // 2**20 + _HOST_MB
+        reserve = self._config.capacity.host_reserve_mb
+        if reserve >= needed:
+            return Finding("ok", "memory reserve", f"{reserve} MiB cover the ZFS ARC and the host")
+        return Finding(
+            "warn",
+            "memory reserve",
+            f"capacity.host_reserve_mb is {reserve} MiB; the ZFS ARC may take {arc // 2**20} MiB",
+            f"raise capacity.host_reserve_mb to at least {needed}, or lower zfs_arc_max",
         )
 
     def _template_storage(self) -> Finding:
@@ -294,3 +314,11 @@ def _ids(vmids: set[int]) -> str:
 
 def _vmid_set(value: object) -> set[int]:
     return {int(part) for part in str(value or "").split(",") if part.strip().isdigit()}
+
+
+def _arc_max(arcstats: str) -> int:
+    """The ARC's maximum in bytes; arcstats without exactly one numeric c_max cannot be checked."""
+    values = [f[2:] for f in (line.split() for line in arcstats.splitlines()) if f[:1] == ["c_max"]]
+    if len(values) != 1 or len(values[0]) != 1 or not values[0][0].isdecimal():
+        raise PveCiError("arcstats names no ZFS ARC maximum")
+    return int(values[0][0])

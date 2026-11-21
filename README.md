@@ -90,8 +90,11 @@ runner firewall and provisions it through the guest agent: the newest Actions ru
 digest GitHub publishes for the release asset), Docker, the GitHub CLI and the Node.js, .NET, Go and Python
 toolchains in the tool cache layout the `setup-*` actions look in first. Your own scripts from
 `template.scripts` run last. The build writes the template VMID that is not in use and marks it finished
-only at the end, so an interrupted build is never cloned. The older template stays until the next build,
-because running VMs may still be linked clones of it.
+only at the end, so an interrupted build is never cloned. The build VM must fit the memory budget and
+the host reserve like a runner VM; when it does not, the build drains the runners (queued jobs wait, or go
+to the hosted runner when `[overflow]` is configured), waits up to two hours for room, and gives up
+without starting anything otherwise. The older template stays until the next build, because running VMs
+may still be linked clones of it.
 
 ## Configuration
 
@@ -170,7 +173,7 @@ management `validate` step.
 | `pve-ci-runners doctor` | checks the host and the GitHub App; every failure names its fix |
 | `pve-ci-runners template build` | builds the next runner template; the weekly timer runs it |
 | `pve-ci-runners status [--json]` | what every slot does, read from the host |
-| `pve-ci-runners drain` / `resume` | stop and resume taking new jobs; running jobs finish |
+| `pve-ci-runners drain` / `resume` | stop and resume taking new jobs; idle VMs are released, running jobs finish |
 | `pve-ci-runners version` | prints the version |
 
 ## Security model

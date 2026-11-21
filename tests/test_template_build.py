@@ -8,6 +8,7 @@ import pytest
 
 from pve_ci_runners import images, template_build
 from pve_ci_runners.config import Config, parse
+from pve_ci_runners.drain import drain, draining, reserved_mb
 from pve_ci_runners.errors import CommandError, PveCiError
 from pve_ci_runners.images import fetch_image
 from pve_ci_runners.lifecycle import IsolationError
@@ -15,7 +16,7 @@ from pve_ci_runners.pve import TAG
 from pve_ci_runners.template_build import TemplateBuilder
 from pve_ci_runners.templates import current_template, decode_marker
 from tests.conftest import config_data
-from tests.fakes import FakeHost, FakeVm
+from tests.fakes import FakeHost, FakeVm, holds_memory_lock
 
 IMAGE = b"cloud image bytes"
 
@@ -271,3 +272,119 @@ def test_every_provisioning_script_is_strict_bash() -> None:
     for name in PROVISION:
         text = script(f"{name}.sh", "provision")
         assert text.startswith("#!/bin/bash\n") and "\nset -euo pipefail\n" in text
+
+
+def busy_host(tmp_path: Path) -> FakeHost:
+    host = FakeHost(total_mb=32000, other_guests_mb=16384)
+    host.snippet_dir = tmp_path
+    for vmid in (121, 122):
+        host.machines[vmid] = FakeVm(name=f"ci-runner-{vmid}", running=True, memory_mb=5120, tags={TAG})
+    return host
+
+
+def test_a_build_drains_the_runners_for_room_and_never_squeezes_other_guests(setup, tmp_path: Path) -> None:
+    config, _ = setup
+    host = busy_host(tmp_path)
+    state_dir = config.daemon.state_dir
+    seen: list[tuple[bool, int]] = []
+
+    def controller_retires_the_idle_runners(_: float) -> None:
+        seen.append((draining(state_dir), reserved_mb(state_dir)))
+        host.machines.pop(121, None)
+        host.machines.pop(122, None)
+
+    TemplateBuilder(
+        config,
+        host,
+        clock=lambda: 1.0,
+        sleep=controller_retires_the_idle_runners,
+        fetch=lambda *_: Path("/i"),
+    ).build()
+
+    assert seen == [(True, 4096)], "the runners drain while the build holds its memory"
+    assert host.events[0] == "create 9201", "the build VM starts only once it fits"
+    assert not draining(state_dir) and reserved_mb(state_dir) == 0
+
+
+def test_a_build_without_room_gives_up_without_starting_anything(setup, tmp_path: Path) -> None:
+    config, _ = setup
+    host = busy_host(tmp_path)
+    now = [0.0]
+
+    def time_passes(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(PveCiError, match="no room"):
+        TemplateBuilder(
+            config, host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
+        ).build()
+
+    assert not any(e.startswith("create") for e in host.events)
+    assert not draining(config.daemon.state_dir) and reserved_mb(config.daemon.state_dir) == 0
+
+
+def test_an_operators_drain_outlasts_the_build(setup, tmp_path: Path) -> None:
+    config, _ = setup
+    host = busy_host(tmp_path)
+    drain(config.daemon.state_dir)
+
+    def freed(_: float) -> None:
+        host.machines.pop(121, None)
+        host.machines.pop(122, None)
+
+    TemplateBuilder(config, host, clock=lambda: 1.0, sleep=freed, fetch=lambda *_: Path("/i")).build()
+
+    assert draining(config.daemon.state_dir)
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_runner_vms_that_appear_during_the_import_keep_the_build_vm_off(
+    setup, monkeypatch: pytest.MonkeyPatch, running: bool
+) -> None:
+    config, host = setup
+    host.total_mb, host.other_guests_mb = 32000, 16384
+    create = host.create
+
+    def controller_starts_runners_meanwhile(vmid: int, options) -> None:
+        create(vmid, options)
+        for slot in (121, 122):
+            host.machines[slot] = FakeVm(
+                name=f"ci-runner-{slot}", running=running, memory_mb=5120, tags={TAG}
+            )
+
+    monkeypatch.setattr(host, "create", controller_starts_runners_meanwhile)
+
+    with pytest.raises(PveCiError, match="no room"):
+        builder(config, host).build()
+
+    assert "start 9201" not in host.events and "destroy 9201" in host.events
+    assert not draining(config.daemon.state_dir) and reserved_mb(config.daemon.state_dir) == 0
+
+
+def test_the_build_vm_starts_under_the_memory_lock_the_controller_takes_too(
+    setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, host = setup
+    locked: list[bool] = []
+    start = host.start
+
+    def recording_start(vmid: int) -> None:
+        locked.append(holds_memory_lock(config.daemon.state_dir))
+        start(vmid)
+
+    monkeypatch.setattr(host, "start", recording_start)
+    builder(config, host).build()
+
+    assert locked == [True]
+    assert not holds_memory_lock(config.daemon.state_dir)
+
+
+def test_a_build_vm_that_cannot_keep_its_out_of_memory_priority_is_removed(setup) -> None:
+    config, host = setup
+    host.unprotectable.add(9201)
+
+    with pytest.raises(CommandError, match="out-of-memory priority"):
+        builder(config, host).build()
+
+    assert "destroy 9201" in host.events
+    assert not [s for s in host.scripts if s[1] != "probe"], "no provisioning step runs unprotected"

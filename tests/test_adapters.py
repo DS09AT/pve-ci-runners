@@ -7,7 +7,7 @@ import pytest
 
 from pve_ci_runners.cache_zfs import KEY_PROPERTY, PROMOTING_PROPERTY, RUN_PROPERTY, RUNNER_PROPERTY, ZfsCache
 from pve_ci_runners.config import Config
-from pve_ci_runners.drain import drain, draining, resume
+from pve_ci_runners.drain import drain, draining, reserve, reserved_mb, resume
 from pve_ci_runners.errors import CommandError, GuestError
 from pve_ci_runners.logs import prune_logs
 from pve_ci_runners.proc import HostCommands, output, succeeds
@@ -147,9 +147,11 @@ def test_node_status_without_memory_is_an_error() -> None:
         Pve(Script({("pvesh",): done("<html>")}), node="pve1").vms()
 
 
-def test_vm_operations_call_qm_with_fixed_arguments() -> None:
+def test_vm_operations_call_qm_with_fixed_arguments(tmp_path: Path) -> None:
     script = Script({("qm", "agent"): done("", 2)})
-    pve = Pve(script, node="pve1")
+    (tmp_path / "121.pid").write_text("4242\n", encoding="utf-8")
+    (tmp_path / "4242").mkdir()
+    pve = Pve(script, node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
     pve.clone(9201, 121, "ci-runner-121")
     pve.start(121)
     pve.attach(121, "scsi1", "/dev/zvol/rpool/x", "cicache")
@@ -163,6 +165,60 @@ def test_vm_operations_call_qm_with_fixed_arguments() -> None:
         ["qm", "set", "121", "--scsi1", "/dev/zvol/rpool/x,serial=cicache,discard=on"],
         ["qm", "set", "121", "--delete", "scsi1"],
     ]
+
+
+def test_a_started_vm_is_the_first_the_kernel_sacrifices_or_it_is_stopped_again(tmp_path: Path) -> None:
+    script = Script()
+    (tmp_path / "121.pid").write_text("4242\n", encoding="utf-8")
+    (tmp_path / "4242").mkdir()
+    pve = Pve(script, node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
+
+    pve.start(121)
+    assert (tmp_path / "4242" / "oom_score_adj").read_text(encoding="utf-8") == "1000"
+
+    with pytest.raises(CommandError, match="out-of-memory priority"):
+        pve.start(122)
+    assert ["qm", "stop", "122", "--skiplock", "1"] in script.calls
+
+
+class _TimedOutStart(Script):
+    def run(self, argv, *, stdin=None, timeout=300):
+        if list(argv[:2]) == ["qm", "start"]:
+            self.calls.append(list(argv))
+            raise CommandError("qm start timed out after 180 s")
+        return super().run(argv, stdin=stdin, timeout=timeout)
+
+
+@pytest.mark.parametrize("script", [Script({("qm", "start"): done("", 1)}), _TimedOutStart()])
+def test_a_vm_whose_start_fails_is_stopped_because_qemu_may_run_anyway(
+    tmp_path: Path, script: Script
+) -> None:
+    pve = Pve(script, node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
+
+    with pytest.raises(CommandError, match="failed to start and was stopped"):
+        pve.start(121)
+    assert script.calls[-1] == ["qm", "stop", "121", "--skiplock", "1"]
+
+
+def test_a_vm_that_fails_to_start_and_to_stop_is_reported_as_possibly_unprotected(tmp_path: Path) -> None:
+    pve = Pve(Script({("qm", "stop"): done("", 1)}), node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
+
+    with pytest.raises(CommandError, match="may run unprotected"):
+        pve.start(121)
+
+
+def test_protecting_a_vm_sets_and_reads_back_its_out_of_memory_priority(tmp_path: Path) -> None:
+    pve = Pve(Script(), node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
+    (tmp_path / "121.pid").write_text("4242\n", encoding="utf-8")
+    (tmp_path / "4242").mkdir()
+    (tmp_path / "4242" / "oom_score_adj").write_text("0\n", encoding="utf-8")
+
+    pve.protect(121)
+    assert (tmp_path / "4242" / "oom_score_adj").read_text(encoding="utf-8") == "1000"
+
+    (tmp_path / "121.pid").write_text("not a pid\n", encoding="utf-8")
+    with pytest.raises(CommandError, match="out-of-memory priority"):
+        pve.protect(121)
 
 
 def zfs_cache(config: Config, script: Script, clock: float = 2_000_000_000.0) -> ZfsCache:
@@ -377,6 +433,19 @@ def test_drain_flag_round_trip(tmp_path: Path) -> None:
     resume(tmp_path / "state")
     resume(tmp_path / "state")
     assert not draining(tmp_path / "state")
+
+
+def test_a_reservation_is_replaced_whole_and_an_empty_one_keeps_everything_reserved(tmp_path: Path) -> None:
+    reservation = tmp_path / "reservation"
+    reservation.write_text("", encoding="utf-8")
+    assert reserved_mb(tmp_path) == 2**31
+    before = reservation.stat().st_ino
+
+    reserve(tmp_path, 4096)
+
+    assert reserved_mb(tmp_path) == 4096
+    assert reservation.stat().st_ino != before, "written beside it and renamed, never truncated in place"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["reservation"]
 
 
 def test_old_logs_are_pruned_and_symlinks_left_alone(tmp_path: Path) -> None:

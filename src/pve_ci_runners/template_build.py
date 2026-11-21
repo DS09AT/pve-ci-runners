@@ -16,7 +16,9 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+from pve_ci_runners.capacity import HostMemory, vms_that_fit
 from pve_ci_runners.config import Config, Slot
+from pve_ci_runners.drain import drain, draining, memory_lock, release, reserve, resume
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.firewall import render
 from pve_ci_runners.guest import Guest, script, with_inputs
@@ -32,6 +34,9 @@ _STEP_TIMEOUT = 1800
 _AGENT_TIMEOUT = 1200
 _SHUTDOWN_TIMEOUT = 300
 _POLL = 10.0
+_ROOM_POLL = 30.0
+_ROOM_TIMEOUT = 7200
+_NO_ROOM = "the host has no room for the build VM, so it was not started"
 log = logging.getLogger("pve_ci_runners")
 
 
@@ -68,10 +73,53 @@ class TemplateBuilder:
             snippet = self._host.snippet_path(self._snippet(vmid))
             snippet.write_text(script("user-data.yaml", _PROVISION), encoding="utf-8")
             try:
-                version = self._build_vm(vmid, image, scripts)
+                with self._room():
+                    version = self._build_vm(vmid, image, scripts)
             finally:
                 snippet.unlink(missing_ok=True)
             return vmid, version
+
+    @contextmanager
+    def _room(self) -> Generator[None]:
+        """Holds memory for the build VM, and drains the runners until the host has that much to spare.
+
+        The reservation keeps the controller from starting runner VMs into the memory the build needs;
+        the host's other guests never give way to a build.
+        """
+        state_dir = self._config.daemon.state_dir
+        reserve(state_dir, self._config.template.memory_mb)
+        drained = False
+        try:
+            deadline = self._clock() + _ROOM_TIMEOUT
+            while not self._fits():
+                if not drained and not draining(state_dir):
+                    log.info("draining the runners to make room for the build VM")
+                    drain(state_dir)
+                    drained = True
+                if self._clock() > deadline:
+                    raise PveCiError(_NO_ROOM)
+                self._sleep(_ROOM_POLL)
+            yield
+        finally:
+            if drained:
+                resume(state_dir)
+            release(state_dir)
+
+    def _fits(self) -> bool:
+        capacity, slots = self._config.capacity, {s.vmid for s in self._config.slots}
+        runners = [info for vmid, info in self._host.vms().items() if vmid in slots]
+        host = self._host.host_memory()
+        # A slot VM that is not running yet is about to boot; its memory is already promised.
+        booting = sum(info.memory_mb for info in runners if not info.running)
+        return (
+            vms_that_fit(
+                HostMemory(host.total_mb, host.committed_mb + booting),
+                reserve_mb=capacity.host_reserve_mb,
+                budget_left_mb=capacity.memory_mb - sum(info.memory_mb for info in runners),
+                vm_mb=self._config.template.memory_mb,
+            )
+            >= 1
+        )
 
     def _build_vm(self, vmid: int, image: Path, scripts: list[str]) -> str:
         self._create(vmid, image)
@@ -145,7 +193,11 @@ class TemplateBuilder:
         # cannot replace another VM's rules; the VM still boots only once the file exists.
         self._host.write_firewall(vmid, render(Slot(vmid, template.address), self._config.firewall))
         self._host.resize(vmid, "scsi0", f"{template.disk_gb}G")
-        self._host.start(vmid)
+        # Checked again: runner VMs may have started while the image was imported.
+        with memory_lock(self._config.daemon.state_dir):
+            if not self._fits():
+                raise PveCiError(_NO_ROOM)
+            self._host.start(vmid)
         deadline = self._clock() + _AGENT_TIMEOUT
         while not self._host.agent_ready(vmid):
             if self._clock() > deadline:
@@ -164,16 +216,21 @@ class TemplateBuilder:
         ]
         for name, inputs in steps:
             log.info("build VM %s: %s", vmid, name)
-            self._host.guest(vmid, with_inputs(name, inputs, _PROVISION), timeout=_STEP_TIMEOUT)
+            self._step(vmid, with_inputs(name, inputs, _PROVISION))
         for path, text in zip(template.scripts, scripts, strict=True):
             log.info("build VM %s: %s", vmid, path)
-            self._host.guest(vmid, text, timeout=_STEP_TIMEOUT)
-        report = self._host.guest(vmid, with_inputs("finish", {}, _PROVISION), timeout=_STEP_TIMEOUT)
+            self._step(vmid, text)
+        report = self._step(vmid, with_inputs("finish", {}, _PROVISION))
         lines = report.strip().splitlines()
         version = lines[-1].strip() if lines else ""
         if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
             raise PveCiError(f"the build VM {vmid} reports no runner version")
         return version
+
+    def _step(self, vmid: int, text: str) -> str:
+        # A build VM restarted outside the build runs in a new QEMU process with the default priority.
+        self._host.protect(vmid)
+        return self._host.guest(vmid, text, timeout=_STEP_TIMEOUT)
 
     def _seal(self, vmid: int, version: str) -> None:
         self._host.shutdown(vmid, _SHUTDOWN_TIMEOUT)

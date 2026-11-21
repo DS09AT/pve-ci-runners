@@ -34,11 +34,19 @@ class Pve:
     """The node this controller runs on."""
 
     def __init__(
-        self, commands: Commands, *, node: str | None = None, firewall_dir: Path = Path("/etc/pve/firewall")
+        self,
+        commands: Commands,
+        *,
+        node: str | None = None,
+        firewall_dir: Path = Path("/etc/pve/firewall"),
+        run_dir: Path = Path("/var/run/qemu-server"),
+        proc_dir: Path = Path("/proc"),
     ) -> None:
         self._commands = commands
         self.node = node or socket.gethostname().split(".")[0]
         self._firewall_dir = firewall_dir
+        self._run_dir = run_dir
+        self._proc_dir = proc_dir
 
     def vms(self) -> dict[int, VmInfo]:
         """Every VM on this node."""
@@ -146,8 +154,35 @@ class Pve:
         (self._firewall_dir / f"{vmid}.fw").write_text(text, encoding="utf-8")
 
     def start(self, vmid: int) -> None:
-        """Boots a VM."""
-        output(self._commands, ["qm", "start", str(vmid)], timeout=180)
+        """Boots a VM that the kernel sacrifices first should the host ever run out of memory.
+
+        The memory guard keeps the host's other guests safe; this is the layer behind it. A VM whose
+        priority cannot be lowered is stopped again rather than left running unprotected. A failed or
+        timed-out `qm start` may still have launched QEMU, so it is stopped as well.
+        """
+        try:
+            output(self._commands, ["qm", "start", str(vmid)], timeout=180)
+            self.protect(vmid)
+        except CommandError as err:
+            try:
+                output(self._commands, ["qm", "stop", str(vmid), "--skiplock", "1"], timeout=180)
+            except CommandError:
+                raise CommandError(
+                    f"VM {vmid} failed to start ({err}) and could not be stopped; it may run unprotected"
+                ) from None
+            raise CommandError(f"VM {vmid} failed to start and was stopped: {err}") from None
+
+    def protect(self, vmid: int) -> None:
+        """Makes a running VM the first process the kernel kills should the host run out of memory."""
+        try:
+            pid = int((self._run_dir / f"{vmid}.pid").read_text(encoding="utf-8").strip())
+            score = self._proc_dir / str(pid) / "oom_score_adj"
+            score.write_text("1000", encoding="utf-8")
+            protected = score.read_text(encoding="utf-8").strip() == "1000"
+        except (OSError, ValueError):
+            protected = False
+        if not protected:
+            raise CommandError(f"VM {vmid}: its out-of-memory priority could not be set")
 
     def destroy(self, vmid: int) -> None:
         """Stops and removes a VM with its disks and firewall file."""

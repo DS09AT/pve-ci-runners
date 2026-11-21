@@ -7,13 +7,13 @@ import pytest
 from pve_ci_runners.cache import cache_key
 from pve_ci_runners.config import Config, parse
 from pve_ci_runners.controller import Controller, profile_for
-from pve_ci_runners.drain import drain
+from pve_ci_runners.drain import drain, reserve
 from pve_ci_runners.errors import CommandError
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.pve import TAG
 from pve_ci_runners.state import VerifiedJob, decode
 from tests.conftest import config_data
-from tests.fakes import HEAD, FakeCache, FakeGitHub, FakeHost, FakeVm
+from tests.fakes import HEAD, FakeCache, FakeGitHub, FakeHost, FakeVm, holds_memory_lock
 
 KEY = cache_key("example-org/app", "ci.yml", "build")
 
@@ -518,3 +518,86 @@ def test_a_failed_write_back_still_drops_the_clone_and_removes_the_registration(
 
     assert cache.dropped == [KEY]
     assert github.removed == [runner]
+
+
+def test_memory_a_template_build_reserves_is_never_given_to_runners(setup) -> None:
+    config, host, github, cache, clock = setup
+    reserve(config.daemon.state_dir, 40000)
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201}
+
+
+def test_draining_releases_idle_vms(setup) -> None:
+    config, host, github, cache, clock = setup
+    ctl = controller(config, host, github, cache, clock)
+    ctl.cycle()
+    ctl.cycle()
+    assert state(host, 121).phase == "warm"
+
+    drain(config.daemon.state_dir)
+    ctl.cycle()
+
+    assert 121 not in host.machines and 122 not in host.machines
+
+
+@pytest.mark.parametrize("phase", ["booting", "warm"])
+def test_a_running_vm_whose_out_of_memory_priority_cannot_be_set_is_never_handed_a_job(
+    setup, phase: str
+) -> None:
+    config, host, github, cache, clock = setup
+    ctl = controller(config, host, github, cache, clock)
+    ctl.cycle()
+    if phase == "warm":
+        ctl.cycle()
+    assert state(host, 121).phase == phase
+    prepared = host.scripts.count((121, "prepare"))
+    host.unprotectable.add(121)
+    github.queue("example-org/app")
+
+    ctl.cycle()
+
+    assert "destroy 121" in host.events
+    assert host.scripts.count((121, "prepare")) == prepared, "removed before it is warmed up"
+    assert not any(name.startswith("ci-runner-121-") for name in github.registered)
+
+
+def test_an_assigned_vm_that_cannot_be_protected_gives_back_its_cache_and_registration(setup) -> None:
+    _, host, github, cache, _ = setup
+    ctl = started_job(setup)
+    runner = state(host, 121).runner
+    host.unprotectable.add(121)
+
+    ctl.cycle()
+
+    assert 121 not in host.machines
+    assert cache.written == [] and cache.dropped == [KEY]
+    assert github.removed == [runner]
+
+
+def test_a_vm_restarted_outside_the_controller_is_protected_again_on_the_next_cycle(setup) -> None:
+    config, host, github, cache, clock = setup
+    ctl = controller(config, host, github, cache, clock)
+    ctl.cycle()
+    host.protected.clear()
+
+    ctl.cycle()
+
+    assert 121 in host.protected
+
+
+def test_runner_vms_start_only_under_the_memory_lock_a_template_build_takes_too(setup, monkeypatch) -> None:
+    config, host, github, cache, clock = setup
+    locked: list[bool] = []
+    start = host.start
+
+    def recording_start(vmid: int) -> None:
+        locked.append(holds_memory_lock(config.daemon.state_dir))
+        start(vmid)
+
+    monkeypatch.setattr(host, "start", recording_start)
+    controller(config, host, github, cache, clock).cycle()
+
+    assert locked == [True]
+    assert not holds_memory_lock(config.daemon.state_dir)

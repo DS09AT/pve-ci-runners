@@ -19,6 +19,7 @@ HEALTHY = {
     ("pvesh", "get", "/storage/local"): done({"type": "dir", "content": "iso,snippets,vztmpl"}),
     ("zfs", "list", "-H", "-o", "name", "rpool/ci-cache"): done("rpool/ci-cache\n"),
     ("pvesh", "get", "/cluster/backup"): done([]),
+    ("cat", "/proc/spl/kstat/zfs/arcstats"): done(f"c_max                           4    {2 * 2**30}\n"),
 }
 ALL_GRANTED = {
     "administration": "write",
@@ -203,3 +204,30 @@ def test_a_fix_keeps_the_values_already_set(
     findings = run(config, {**HEALTHY, command: answer})
 
     assert findings[check].level == "fail" and findings[check].fix == fix
+
+
+def test_a_reserve_that_does_not_cover_the_zfs_arc_is_a_warning(config: Config) -> None:
+    arc = {("cat", "/proc/spl/kstat/zfs/arcstats"): done(f"c_max   4    {8 * 2**30}\n")}
+
+    finding = run(config, {**HEALTHY, **arc})["memory reserve"]
+
+    assert finding.level == "warn" and "9216" in finding.fix
+    assert (
+        run(config, {**HEALTHY, ("test", "-d", "/proc/spl/kstat/zfs"): done("", 1)})["memory reserve"].level
+        == "ok"
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        done("", 1, "cat: arcstats: Permission denied"),
+        done(""),
+        done("c_max   4\n"),
+        done("c_max   4    abc\n"),
+    ],
+)
+def test_arcstats_that_cannot_be_read_or_parsed_on_a_zfs_host_fail_the_check(config: Config, answer) -> None:
+    finding = run(config, {**HEALTHY, ("cat", "/proc/spl/kstat/zfs/arcstats"): answer})["memory reserve"]
+
+    assert finding.level == "fail" and finding.detail.startswith("could not be checked")
