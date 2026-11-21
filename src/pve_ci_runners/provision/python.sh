@@ -2,10 +2,11 @@
 # Python in the tool cache layout setup-python looks in first. Inputs: VERSION.
 set -euo pipefail
 
-# shellcheck source=/dev/null # the image's release file, read for VERSION_ID
-. /etc/os-release
+# Read in a subshell: os-release defines VERSION too, which would replace the Python version input.
+# shellcheck source=/dev/null # the image's release file
+os_version=$(. /etc/os-release && echo "$VERSION_ID")
 url=$(curl -fsSL https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json |
-  jq -r --arg v "$VERSION" --arg os "$VERSION_ID" \
+  jq -r --arg v "$VERSION" --arg os "$os_version" \
     '.[] | select(.version == $v) | .files[]
      | select(.platform == "linux" and .platform_version == $os and .arch == "x64") | .download_url' |
   head -n 1)
