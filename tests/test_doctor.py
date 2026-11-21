@@ -25,7 +25,7 @@ ALL_GRANTED = {
     "actions": "read",
     "metadata": "read",
     "contents": "read",
-    "variables": "write",
+    "actions_variables": "write",
 }
 
 
@@ -136,14 +136,14 @@ def test_vmids_held_by_foreign_vms_are_named(config: Config) -> None:
 
 
 def test_missing_app_permissions_and_an_old_runner_are_reported(config: Config) -> None:
-    granted = {"administration": "read", "actions": "read", "metadata": "read", "actions_variables": "write"}
+    granted = {"administration": "read", "actions": "read", "metadata": "read", "variables": "write"}
 
     findings = run(config, HEALTHY, app=App(granted, latest="v2.341.0"))
 
     assert findings["GitHub App"].level == "fail"
     assert "administration: write" in findings["GitHub App"].detail
     assert "contents: read" in findings["GitHub App"].detail
-    assert "variables" not in findings["GitHub App"].detail
+    assert "actions_variables: write" in findings["GitHub App"].detail
     assert findings["template"].level == "warn" and "2.341.0" in findings["template"].detail
 
 

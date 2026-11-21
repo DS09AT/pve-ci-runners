@@ -111,6 +111,7 @@ jobs:
               dpkg --ignore-depends=qemu-server,pve-manager -i /dist/*.deb
               pve-ci-runners version
               pve-ci-runners -c /usr/share/doc/pve-ci-runners/config.example.toml config check
+              if pve-ci-runners -c /nonexistent.toml config check; then exit 1; fi
               test "$(stat -c %a /etc/pve-ci-runners)" = 700
             '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

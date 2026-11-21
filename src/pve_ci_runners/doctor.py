@@ -209,10 +209,8 @@ class Doctor:
     def _app(self) -> Finding:
         needed = {"administration": "write", "actions": "read", "metadata": "read", "contents": "read"}
         if self._config.overflow is not None:
-            needed["variables"] = "write"
+            needed["actions_variables"] = "write"
         granted = self._github.permissions()
-        if "actions_variables" in granted:
-            granted.setdefault("variables", granted["actions_variables"])
         missing = sorted(
             f"{name}: {level}"
             for name, level in needed.items()

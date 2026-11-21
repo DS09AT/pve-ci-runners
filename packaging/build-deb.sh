@@ -18,9 +18,11 @@ find "$work/app" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 root="$work/root"
 install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/systemd/system" "$root/usr/share/doc/pve-ci-runners"
 install -d -m 0700 "$root/etc/pve-ci-runners"
+# zipapp's own -m entry point drops the return value, so every exit status would be 0.
+printf 'import sys\n\nfrom pve_ci_runners.cli import main\n\nsys.exit(main())\n' >"$work/app/__main__.py"
+touch -h -d "@$SOURCE_DATE_EPOCH" "$work/app/__main__.py"
 # -I keeps the environment and the working directory out of the module search path of a root daemon.
-python3 -m zipapp "$work/app" -p '/usr/bin/python3 -I' -m 'pve_ci_runners.cli:main' -c \
-  -o "$root/usr/bin/pve-ci-runners"
+python3 -m zipapp "$work/app" -p '/usr/bin/python3 -I' -c -o "$root/usr/bin/pve-ci-runners"
 chmod 0755 "$root/usr/bin/pve-ci-runners"
 install -m 0644 packaging/*.service packaging/*.timer "$root/usr/lib/systemd/system/"
 install -m 0644 LICENSE "$root/usr/share/doc/pve-ci-runners/copyright"
