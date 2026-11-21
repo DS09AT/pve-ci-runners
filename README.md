@@ -186,7 +186,9 @@ management `validate` step.
 - A runner VM is destroyed at the latest `daemon.max_job_seconds` (default 23400, 6.5 hours) after it took
   a job, whatever its guest reports.
 
-See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
+Please report vulnerabilities privately through GitHub's
+[private vulnerability reporting](https://github.com/DS09AT/pve-ci-runners/security/advisories/new), not in
+public issues.
 
 ## Limitations
 
@@ -198,7 +200,15 @@ See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerab
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+uv sync
+uv run pytest --cov --cov-report=json && uv run python scripts/check_quality.py
+uvx pre-commit run --all-files
+```
+
+Changes go to `develop` through pull requests; `main` takes pull requests only. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/), from which release-please writes the
+[changelog](CHANGELOG.md) and prepares each release.
 
 ## License
 
