@@ -1,0 +1,40 @@
+# Python and tooling caches
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build output
+/dist/
+/build/
+*.egg-info/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local configuration and keys must never be committed
+*.pem
+*.key
+/config.toml
+/local/
+
+# AI agent instructions, plans and local tool state stay on the workstation
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.codex/
+.cursor/
+.mcp.json
+.playwright-mcp/
+/.repowise
+/.docs

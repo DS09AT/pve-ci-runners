@@ -1,0 +1,67 @@
+# Hooks run before every commit and, except the local ones, again in CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-added-large-files
+      - id: check-executables-have-shebangs
+      - id: detect-private-key
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 9026c9127e153371d7a78dfcb0c45ae2046a3d10  # frozen: v0.17.6
+    hooks:
+      - id: ruff-format
+      - id: ruff
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: 68e8b45440415753fff70a312ece8da92ba85b4a  # frozen: v1.5.0
+    hooks:
+      - id: detect-secrets
+        # Commit SHAs that pin hooks and actions are not secrets; this file holds nothing else of note.
+        args: [--baseline, .secrets.baseline, --exclude-lines, 'uses: [^@]+@[0-9a-f]{40}']
+        exclude: ^\.pre-commit-config\.yaml$
+  - repo: https://github.com/codespell-project/codespell
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8  # frozen: v2.4.3
+    hooks:
+      - id: codespell
+        additional_dependencies: [tomli]
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: 479be5958357ba5ab65ce47172117348516860e9  # frozen: v3.14.1-1
+    hooks:
+      - id: shfmt
+        args: [-w, -i, "2", -ci]
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: 06a39750ec31860bb44f2acf67182c40016cd1e7  # frozen: v1.32.0
+    hooks:
+      - id: zizmor
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: 0ece078fe7bb21d31d47f4fd0d3376051eb5b756  # frozen: v4.19.4
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: pytest
+        name: pytest
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        types: [python]

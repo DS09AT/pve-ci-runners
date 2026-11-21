@@ -1,0 +1,272 @@
+import copy
+import os
+from pathlib import Path
+
+import pytest
+
+from pve_ci_runners.config import DEFAULT_MOUNTS, check_secret_file, load, parse
+from pve_ci_runners.errors import ConfigError
+from tests.conftest import BASE, config_data
+
+
+def test_the_base_configuration_parses_with_defaults() -> None:
+    config = parse(config_data())
+
+    assert config.profiles[0].qm_options == (("cpuunits", "100"),)
+    assert config.cache.mounts == DEFAULT_MOUNTS
+    assert config.overflow is not None
+    assert config.overflow.self_value == '["self-hosted","pve-ci"]'
+    assert config.daemon.poll_seconds == 15
+    assert config.daemon.max_job_seconds == 23400
+    assert str(config.network.network) == "192.168.100.0/24"
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("github", "tokn", "x", "unknown key"),
+        ("github", "owner", "-bad-", "does not match"),
+        ("github", "api_url", "http://api.github.com", "does not match"),
+        ("network", "prefix", 31, "between 8 and 30"),
+        ("network", "dns", [], "between 1 and 3"),
+        ("capacity", "memory_mb", "lots", "must be an integer"),
+        ("capacity", "memory_mb", True, "must be an integer"),
+    ],
+)
+def test_invalid_values_name_the_key(section: str, key: str, value: object, message: str) -> None:
+    data = config_data()
+    data[section][key] = value
+
+    with pytest.raises(ConfigError, match=message):
+        parse(data)
+
+
+def test_a_missing_section_is_an_error() -> None:
+    with pytest.raises(ConfigError, match="network: is required"):
+        parse(config_data(network=None))
+
+
+def test_an_unknown_top_level_section_is_an_error() -> None:
+    data = config_data()
+    data["runners"] = {}
+
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse(data)
+
+
+@pytest.mark.parametrize("option", ["args", "hookscript", "net0", "description", "scsi0"])
+def test_profiles_cannot_set_options_the_controller_owns_or_that_run_code(option: str) -> None:
+    data = config_data()
+    data["profile"][0]["qm_options"] = {option: "x"}
+
+    with pytest.raises(ConfigError, match="not an allowed key"):
+        parse(data)
+
+
+def test_option_values_cannot_smuggle_further_options() -> None:
+    data = config_data()
+    data["profile"][0]["qm_options"] = {"cpu": "host,flags=+aes"}
+
+    with pytest.raises(ConfigError, match="single value"):
+        parse(data)
+
+
+def test_slots_must_be_distinct_host_addresses_off_the_gateway() -> None:
+    for address, message in (
+        ("192.168.100.22", "own address"),
+        ("192.168.100.1", "is the gateway"),
+        ("192.168.101.5", "not a host address"),
+        ("192.168.100.255", "not a host address"),
+    ):
+        data = config_data()
+        data["slot"][0]["address"] = address
+        with pytest.raises(ConfigError, match=message):
+            parse(data)
+
+
+@pytest.mark.parametrize(
+    ("gateway", "prefix"), [("203.0.113.1", 24), ("172.15.0.1", 16), ("172.16.0.1", 11), ("169.254.0.1", 16)]
+)
+def test_the_bridge_network_must_lie_inside_a_denied_private_range(gateway: str, prefix: int) -> None:
+    data = config_data()
+    data["network"] |= {"gateway": gateway, "prefix": prefix}
+
+    with pytest.raises(ConfigError, match=r"network\.gateway: the bridge network must lie inside"):
+        parse(data)
+
+
+@pytest.mark.parametrize(
+    ("daemon", "message"),
+    [
+        ({"max_job_seconds": 3599}, "between 3600 and 604800"),
+        ({"max_job_seconds": 604801}, "between 3600 and 604800"),
+        ({"max_job_seconds": 7200, "idle_timeout_seconds": 7200}, "must exceed idle_timeout_seconds"),
+        ({"max_job_secs": 7200}, "unknown key"),
+    ],
+)
+def test_the_job_lifetime_is_bounded_and_longer_than_the_idle_timeout(
+    daemon: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        parse(config_data(daemon=daemon))
+
+
+def test_slot_and_template_vmids_must_differ() -> None:
+    data = config_data()
+    data["template"]["vmids"] = [121, 9202]
+
+    with pytest.raises(ConfigError, match="own VMID"):
+        parse(data)
+
+
+def test_profiles_cannot_promise_more_than_the_slots_or_the_memory_budget() -> None:
+    data = config_data()
+    data["profile"][0]["max"] = 3
+    with pytest.raises(ConfigError, match="number of slots"):
+        parse(data)
+
+    data = config_data(capacity={"memory_mb": 8192})
+    with pytest.raises(ConfigError, match="memory_mb"):
+        parse(data)
+
+
+def test_profile_match_labels_are_unique_and_exclusive() -> None:
+    second = copy.deepcopy(BASE["profile"][0]) | {"name": "large", "max": 0}
+    data = config_data(profile=[BASE["profile"][0], second | {"max": 1}])
+    data["profile"][0]["max"] = 1
+    with pytest.raises(ConfigError, match="unique"):
+        parse(data)
+
+    second = second | {"match": "pve-ci-large", "labels": ["self-hosted", "pve-ci-large", "pve-ci"], "max": 1}
+    data = config_data(profile=[BASE["profile"][0] | {"max": 1}, second])
+    with pytest.raises(ConfigError, match="another profile's match label"):
+        parse(data)
+
+
+def test_labels_must_contain_self_hosted_and_the_match_label() -> None:
+    data = config_data()
+    data["profile"][0]["labels"] = ["linux", "pve-ci"]
+
+    with pytest.raises(ConfigError, match="self-hosted"):
+        parse(data)
+
+
+@pytest.mark.parametrize("value", ["ubuntu-latest", "[]", "[1]", '""'])
+def test_overflow_values_must_be_runs_on_json(value: str) -> None:
+    data = config_data()
+    data["overflow"]["hosted_value"] = value
+
+    with pytest.raises(ConfigError, match="JSON"):
+        parse(data)
+
+
+def test_overflow_names_an_existing_profile() -> None:
+    data = config_data()
+    data["overflow"]["profile"] = "large"
+
+    with pytest.raises(ConfigError, match="names no profile"):
+        parse(data)
+
+
+def test_cache_mounts_and_the_none_backend() -> None:
+    data = config_data(cache={"backend": "none", "mount": [{"path": "/home/runner/.cache", "dir": "cache"}]})
+    config = parse(data)
+
+    assert config.cache.backend == "none"
+    assert [str(m.path) for m in config.cache.mounts] == ["/home/runner/.cache"]
+    assert config.cache.mounts[0].owner == "runner"
+
+    data = config_data(cache={"backend": "zfs"})
+    with pytest.raises(ConfigError, match="dataset"):
+        parse(data)
+
+
+@pytest.mark.parametrize("path", ["relative/path", "/home/runner/../etc", "/home/runner/"])
+def test_paths_must_be_absolute_and_normalized(path: str) -> None:
+    data = config_data(cache={"backend": "none", "mount": [{"path": path, "dir": "x"}]})
+
+    with pytest.raises(ConfigError, match="absolute path"):
+        parse(data)
+
+
+def test_firewall_destinations_and_extra_rules_are_validated() -> None:
+    data = config_data(firewall={"ssh_destinations": ["not-a-network"]})
+    with pytest.raises(ConfigError, match="not an IPv4 network"):
+        parse(data)
+
+    data = config_data(firewall={"extra_rules": ["OUT ACCEPT -dest 10.0.0.5 -p tcp -dport 443\n[OPTIONS]"]})
+    with pytest.raises(ConfigError, match="does not match"):
+        parse(data)
+
+    data = config_data(firewall={"extra_rules": ["OUT ACCEPT -dest 10.0.0.5 -p tcp -dport 443 # registry"]})
+    assert parse(data).firewall.extra_rules == ("OUT ACCEPT -dest 10.0.0.5 -p tcp -dport 443 # registry",)
+
+
+def test_template_needs_exactly_two_distinct_vmids() -> None:
+    for vmids in ([9201], [9201, 9201], [9201, "9202"]):
+        data = config_data(template={"vmids": vmids, "storage": "local-zfs"})
+        with pytest.raises(ConfigError, match="vmids"):
+            parse(data)
+
+
+def test_load_reports_unreadable_and_malformed_files(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="cannot be read"):
+        load(tmp_path / "missing.toml")
+
+    broken = tmp_path / "broken.toml"
+    broken.write_text("[github\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="not valid TOML"):
+        load(broken)
+
+
+def test_load_reads_toml(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[github]
+owner = "example-org"
+app_client_id = "Iv23liEXAMPLE"
+[capacity]
+memory_mb = 8192
+[network]
+bridge = "vmbr1"
+gateway = "192.168.100.1"
+prefix = 24
+dns = ["192.0.2.53"]
+[[slot]]
+vmid = 121
+address = "192.168.100.21"
+[[profile]]
+name = "default"
+match = "pve-ci"
+labels = ["self-hosted", "pve-ci"]
+cores = 2
+memory_mb = 4096
+max = 1
+[cache]
+backend = "none"
+[template]
+vmids = [9201, 9202]
+storage = "local-zfs"
+""",
+        encoding="utf-8",
+    )
+
+    assert load(path).profiles[0].warm == 1
+
+
+def test_secret_files_must_be_private_regular_files(tmp_path: Path) -> None:
+    key = tmp_path / "app.pem"
+    key.write_text("x", encoding="utf-8")
+    key.chmod(0o644)
+    with pytest.raises(ConfigError, match="too open"):
+        check_secret_file(key)
+
+    key.chmod(0o600)
+    check_secret_file(key)
+
+    with pytest.raises(ConfigError, match="regular file"):
+        check_secret_file(tmp_path)
+    with pytest.raises(ConfigError, match="cannot be read"):
+        check_secret_file(tmp_path / "missing.pem")
+    assert os.geteuid() == key.stat().st_uid

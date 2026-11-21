@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+# GitHub-hosted runners only: this repository is public, so a pull request from a fork must never run
+# on self-hosted infrastructure. The image is pinned so a runner-image switch cannot change results.
+jobs:
+  checks:
+    name: Lint, types and static analysis
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Sync the development environment
+        run: uv sync --locked --python 3.13
+      - name: Ruff
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: mypy
+        run: uv run mypy
+      - name: Pre-commit hooks
+        env:
+          SKIP: pytest,mypy
+        run: uvx --from 'pre-commit==4.3.0' pre-commit run --all-files --show-diff-on-failure
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Sync the development environment
+        run: uv sync --locked --python 3.13
+      - name: pytest with branch coverage
+        run: uv run pytest --cov --cov-report=term-missing
+
+  zfs:
+    name: ZFS cache backend on a real pool
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Install ZFS
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q zfsutils-linux
+          sudo modprobe zfs
+      - name: Sync the development environment
+        run: uv sync --locked --python 3.13
+      - name: pytest -m zfs as root
+        env:
+          PVE_CI_REQUIRE_ZFS: "1"
+        run: sudo -E env "PATH=$PATH" .venv/bin/pytest -m zfs -v

@@ -1,0 +1,219 @@
+"""In-memory stand-ins for the hypervisor, GitHub and the cache, close enough to drive the controller."""
+
+import json
+from dataclasses import dataclass, field
+
+from pve_ci_runners.actions import QueuedJob, Registration
+from pve_ci_runners.cache import Attachment
+from pve_ci_runners.capacity import HostMemory
+from pve_ci_runners.errors import CommandError, GitHubError, GuestError
+from pve_ci_runners.guest import script
+from pve_ci_runners.pve import VmInfo
+from pve_ci_runners.state import CacheLease, VerifiedJob
+from pve_ci_runners.templates import TemplateMarker
+
+HEAD = "0" * 40
+
+
+@dataclass
+class FakeVm:
+    name: str
+    memory_mb: int = 2048
+    running: bool = False
+    template: bool = False
+    tags: set[str] = field(default_factory=set)
+    description: str = ""
+    agent: bool = True
+    isolated: bool = True
+    run_id: int | None = None
+    done: bool = False
+    journal: str = "journal"
+    silent: bool = False
+    disks: dict[str, str] = field(default_factory=dict)
+    options: dict[str, str] = field(default_factory=dict)
+
+
+class FakeHost:
+    def __init__(self, *, total_mb: int = 64000, other_guests_mb: int = 24000) -> None:
+        self.machines: dict[int, FakeVm] = {}
+        self.total_mb = total_mb
+        self.other_guests_mb = other_guests_mb
+        self.firewall: dict[int, str] = {}
+        self.events: list[str] = []
+        self.scripts: list[tuple[int, str]] = []
+        self.probes: list[str] = []
+        self.addresses: tuple[str, ...] = ("192.168.100.1", "203.0.113.10")
+
+    def add_template(self, vmid: int, built_at: int = 100) -> None:
+        marker = TemplateMarker(built_at=built_at, runner_version="2.338.2").encode()
+        self.machines[vmid] = FakeVm(name=f"tpl-{vmid}", template=True, description=marker)
+
+    def vms(self) -> dict[int, VmInfo]:
+        return {
+            vmid: VmInfo(vmid, vm.name, vm.running, vm.memory_mb, vm.template, frozenset(vm.tags))
+            for vmid, vm in self.machines.items()
+        }
+
+    def config(self, vmid: int) -> dict[str, object]:
+        return {"description": self.machines[vmid].description, **self.machines[vmid].disks}
+
+    def host_memory(self) -> HostMemory:
+        runners = sum(v.memory_mb for v in self.machines.values() if v.running)
+        return HostMemory(self.total_mb, self.other_guests_mb + runners)
+
+    def set_description(self, vmid: int, text: str) -> None:
+        self.machines[vmid].description = text
+
+    def clone(self, template: int, vmid: int, name: str) -> None:
+        assert self.machines[template].template
+        self.machines[vmid] = FakeVm(name=name, disks={"scsi0": "local-zfs:base-disk,iothread=1"})
+        self.events.append(f"clone {vmid}")
+
+    def configure(self, vmid: int, options) -> None:
+        vm = self.machines[vmid]
+        for key, value in options:
+            vm.options[key] = value
+            if key == "description":
+                vm.description = value
+            elif key == "tags":
+                vm.tags = set(value.split(";"))
+            elif key == "memory":
+                vm.memory_mb = int(value)
+            elif key.startswith("scsi"):
+                vm.disks[key] = value
+
+    def limit_disk(self, vmid: int, disk: str, limits) -> None:
+        self.machines[vmid].disks[disk] += "".join(f",{k}={v}" for k, v in limits)
+
+    def write_firewall(self, vmid: int, text: str) -> None:
+        self.firewall[vmid] = text
+
+    def start(self, vmid: int) -> None:
+        assert vmid in self.firewall, "a VM must never boot before its firewall file is written"
+        self.machines[vmid].running = True
+        self.events.append(f"start {vmid}")
+
+    def destroy(self, vmid: int) -> None:
+        self.machines.pop(vmid, None)
+        self.firewall.pop(vmid, None)
+        self.events.append(f"destroy {vmid}")
+
+    def attach(self, vmid: int, disk: str, device: str, serial: str) -> None:
+        self.machines[vmid].disks[disk] = f"{device},serial={serial}"
+
+    def detach(self, vmid: int, disk: str) -> None:
+        self.machines[vmid].disks.pop(disk, None)
+
+    def host_addresses(self) -> tuple[str, ...]:
+        if not self.addresses:
+            raise CommandError("ip addr listed no global address of this node")
+        return self.addresses
+
+    def agent_ready(self, vmid: int) -> bool:
+        return self.machines[vmid].agent
+
+    def guest(self, vmid: int, text: str, *, stdin: str | None = None, timeout: int = 120) -> str:
+        vm = self.machines[vmid]
+        name = next(
+            n
+            for n in ("probe", "report", "finished", "logs", "prepare", "start", "attach", "release", "tidy")
+            if text.endswith(script(n))
+        )
+        self.scripts.append((vmid, name))
+        if vm.silent:
+            raise GuestError("guest agent not running")
+        if name == "probe":
+            self.probes.append(text)
+            if not vm.isolated:
+                raise GuestError("exited 3", 3)
+        if name == "report":
+            return "" if vm.run_id is None or vm.done else json.dumps({"run_id": vm.run_id})
+        if name == "finished":
+            return "{}" if vm.done else ""
+        return vm.journal if name == "logs" else ""
+
+
+class FakeGitHub:
+    def __init__(self) -> None:
+        self.repos: dict[str, str] = {"example-org/app": "main"}
+        self.queued: dict[str, list[QueuedJob]] = {}
+        self.busy: set[str] = set()
+        self.runs: dict[int, VerifiedJob] = {}
+        self.conclusions: dict[int, str] = {}
+        self.heads: dict[str, str] = {"example-org/app": HEAD}
+        self.registered: dict[str, str] = {}
+        self.removed: list[str] = []
+        self.variables: dict[tuple[str, str], str] = {}
+
+    def queue(
+        self, repository: str, labels: tuple[str, ...] = ("self-hosted", "pve-ci"), count: int = 1
+    ) -> None:
+        self.queued.setdefault(repository, []).extend(
+            QueuedJob(frozenset(labels), 900.0) for _ in range(count)
+        )
+
+    def repositories(self) -> dict[str, str]:
+        return dict(self.repos)
+
+    def queued_jobs(self, repository: str) -> list[QueuedJob]:
+        return list(self.queued.get(repository, []))
+
+    def busy_runners(self, repository: str) -> frozenset[str]:
+        return frozenset(self.busy)
+
+    def register(self, repository: str, name: str, labels: tuple[str, ...]) -> Registration:
+        self.registered[name] = repository
+        if self.queued.get(repository):
+            self.queued[repository].pop()
+        return Registration("ZW5jb2RlZA==")
+
+    def verify(self, repository: str, run_id: int, runner: str, *, running: bool) -> VerifiedJob | None:
+        if runner not in self.registered or (running and run_id in self.conclusions):
+            return None
+        return self.runs.get(run_id)
+
+    def branch_head(self, repository: str, branch: str) -> str:
+        if repository not in self.heads:
+            raise GitHubError("branch not found", 404)
+        return self.heads[repository]
+
+    def conclusion(self, repository: str, run_id: int, runner: str) -> str | None:
+        return self.conclusions.get(run_id)
+
+    def remove_runner(self, repository: str, name: str) -> None:
+        self.removed.append(name)
+
+    def set_variable(self, repository: str, name: str, value: str) -> None:
+        self.variables[(repository, name)] = value
+
+
+class FakeCache:
+    def __init__(self) -> None:
+        self.leases: list[CacheLease] = []
+        self.written: list[str] = []
+        self.dropped: list[str] = []
+        self.bytes = 10 * 2**20
+        self.leased_for: dict[str, tuple[str, int]] = {}
+
+    def lease(self, key: str, vmid: int, *, runner: str, run_id: int) -> Attachment:
+        lease = CacheLease(
+            key, f"rpool/ci-cache/jobs/{key.replace('/', '.')}-{vmid}", f"rpool/ci-cache/repos/{key}@g1"
+        )
+        self.leases.append(lease)
+        self.leased_for[lease.clone] = (runner, run_id)
+        return Attachment(lease, f"/dev/zvol/{lease.clone}")
+
+    def written_bytes(self, lease: CacheLease, vmid: int) -> int:
+        return self.bytes
+
+    def write_back(self, lease: CacheLease, vmid: int, *, runner: str, run_id: int) -> bool:
+        if self.leased_for.get(lease.clone) != (runner, run_id):
+            return False
+        self.written.append(lease.key)
+        return True
+
+    def drop(self, lease: CacheLease, vmid: int) -> None:
+        self.dropped.append(lease.key)
+
+    def maintain(self, in_use: set[str]) -> list[str]:
+        return []
