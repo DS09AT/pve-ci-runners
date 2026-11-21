@@ -9,7 +9,6 @@ every later entry is generated from [Conventional Commits](https://www.conventio
 
 ### Continuous Integration
 
-* release with release-please and keep a changelog ([9ec7e66](https://github.com/DS09AT/pve-ci-runners/commit/9ec7e66093dc4362be95442e8610324dffe99749))
 * release with release-please and keep a changelog ([4f9f55e](https://github.com/DS09AT/pve-ci-runners/commit/4f9f55e6f6cbb6d8319ee1fbbe34588038a44129))
 
 ## [0.2.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.1.1...v0.2.0) (2026-11-22)
