@@ -86,7 +86,10 @@ class ZfsCache:
             log.warning("VM %s: its cache clone was leased for another job; not written back", vmid)
             return False
         self._zfs("set", f"{PROMOTING_PROPERTY}={int(self._clock())}", lease.clone)
-        self._zfs("snapshot", f"{lease.clone}@g{int(self._clock())}")
+        # Promote refuses a snapshot name the origin chain already holds, and _expire reads the newest
+        # stamp as the last write, so the stamp must be both new and above the origin's.
+        stamp = max(int(self._clock()), int(lease.origin.rsplit("@g", 1)[1]) + 1)
+        self._zfs("snapshot", f"{lease.clone}@g{stamp}")
         self._zfs("promote", lease.clone)
         self._finish_promotion(lease.clone, golden)
         return True

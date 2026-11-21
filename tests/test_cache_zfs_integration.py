@@ -108,7 +108,8 @@ def test_maintenance_finishes_a_promotion_interrupted_before_the_rename(
     _write(lease.device, tmp_path / "m", "interrupted")
     golden = f"{dataset}/repos/o__r/ci__build"
     _sh("zfs", "set", f"{PROMOTING_PROPERTY}=1", lease.lease.clone)
-    _sh("zfs", "snapshot", f"{lease.lease.clone}@g9")
+    stamp = int(lease.lease.origin.rsplit("@g", 1)[1]) + 1
+    _sh("zfs", "snapshot", f"{lease.lease.clone}@g{stamp}")
     _sh("zfs", "promote", lease.lease.clone)
     _sh("zfs", "destroy", "-r", golden)
 

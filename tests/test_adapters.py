@@ -254,6 +254,14 @@ def test_write_back_promotes_only_when_no_other_job_wrote_first(config: Config) 
         assert ["zfs", "inherit", name, "rpool/ci-cache/repos/o__r/ci__build"] in same.calls
 
 
+def test_a_write_back_in_the_origins_second_snapshots_above_the_origin(config: Config) -> None:
+    lease = CacheLease("o__r/ci__build", CLONE, "rpool/ci-cache/repos/o__r/ci__build@g2000000000")
+    script = Script({**OWNED, ("zfs", "list", "-H", "-t", "snapshot"): done(f"{lease.origin}\n")})
+
+    assert zfs_cache(config, script, clock=2_000_000_000.0).write_back(lease, 121, runner=RUNNER, run_id=42)
+    assert ["zfs", "snapshot", f"{CLONE}@g2000000001"] in script.calls
+
+
 @pytest.mark.parametrize(("runner", "run_id"), [("ci-runner-121-def456", 42), (RUNNER, 41)])
 def test_a_clone_is_only_written_back_for_the_runner_and_run_it_was_leased_for(
     config: Config, runner: str, run_id: int
