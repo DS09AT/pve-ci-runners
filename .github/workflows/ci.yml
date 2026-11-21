@@ -83,3 +83,38 @@ jobs:
         env:
           PVE_CI_REQUIRE_ZFS: "1"
         run: sudo -E env "PATH=$PATH" .venv/bin/pytest -m zfs -v
+
+  package:
+    name: Debian package
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build twice and compare the bytes
+        run: |
+          packaging/build-deb.sh
+          cp dist/SHA256SUMS first.sums
+          rm -rf dist
+          packaging/build-deb.sh
+          diff first.sums dist/SHA256SUMS
+      - name: Install on Debian 13
+        # The Proxmox packages are not in Debian; the test proves the package installs and runs.
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" \
+            debian@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 bash -euc '
+              apt-get update -qq
+              apt-get install -y -qq python3 >/dev/null
+              dpkg --ignore-depends=qemu-server,pve-manager -i /dist/*.deb
+              pve-ci-runners version
+              pve-ci-runners -c /usr/share/doc/pve-ci-runners/config.example.toml config check
+              test "$(stat -c %a /etc/pve-ci-runners)" = 700
+            '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb
+          path: dist/
+          retention-days: 14

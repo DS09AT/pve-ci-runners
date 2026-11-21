@@ -2,17 +2,23 @@
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from pve_ci_runners.actions import QueuedJob, Registration
 from pve_ci_runners.cache import Attachment
 from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.errors import CommandError, GitHubError, GuestError
 from pve_ci_runners.guest import script
+from pve_ci_runners.proc import Completed
 from pve_ci_runners.pve import VmInfo
 from pve_ci_runners.state import CacheLease, VerifiedJob
 from pve_ci_runners.templates import TemplateMarker
 
 HEAD = "0" * 40
+
+
+GUEST = ("probe", "report", "finished", "logs", "prepare", "start", "attach", "release", "tidy")
+PROVISION = ("base", "docker", "gh", "node", "dotnet", "go", "python", "finish")
 
 
 @dataclass
@@ -41,8 +47,14 @@ class FakeHost:
         self.firewall: dict[int, str] = {}
         self.events: list[str] = []
         self.scripts: list[tuple[int, str]] = []
+        self.undestroyable: set[int] = set()
+        self.failing_steps: set[str] = set()
+        self.runner_version = "2.340.1"
+        self.snippet_dir = Path("/nonexistent")
         self.probes: list[str] = []
         self.addresses: tuple[str, ...] = ("192.168.100.1", "203.0.113.10")
+        self.datacenter_firewall = True
+        self.uncreatable: set[int] = set()
 
     def add_template(self, vmid: int, built_at: int = 100) -> None:
         marker = TemplateMarker(built_at=built_at, runner_version="2.338.2").encode()
@@ -94,6 +106,8 @@ class FakeHost:
         self.events.append(f"start {vmid}")
 
     def destroy(self, vmid: int) -> None:
+        if vmid in self.undestroyable:
+            raise CommandError(f"qm destroy {vmid} failed")
         self.machines.pop(vmid, None)
         self.firewall.pop(vmid, None)
         self.events.append(f"destroy {vmid}")
@@ -112,13 +126,40 @@ class FakeHost:
     def agent_ready(self, vmid: int) -> bool:
         return self.machines[vmid].agent
 
+    def create(self, vmid: int, options) -> None:
+        if vmid in self.uncreatable:
+            raise CommandError(f"qm create {vmid} failed: VM {vmid} already exists on node 'pve2'")
+        values = dict(options)
+        self.machines[vmid] = FakeVm(name=values["name"], tags=set(values["tags"].split(";")), options=values)
+        self.events.append(f"create {vmid}")
+
+    def resize(self, vmid: int, disk: str, size: str) -> None:
+        self.events.append(f"resize {vmid} {disk} {size}")
+
+    def shutdown(self, vmid: int, timeout: int) -> None:
+        self.machines[vmid].running = False
+        self.events.append(f"shutdown {vmid}")
+
+    def make_template(self, vmid: int) -> None:
+        self.machines[vmid].template = True
+        self.events.append(f"template {vmid}")
+
+    def firewall_enabled(self) -> bool:
+        return self.datacenter_firewall
+
+    def snippet_path(self, volume: str) -> Path:
+        return self.snippet_dir / volume.split("/", 1)[1]
+
     def guest(self, vmid: int, text: str, *, stdin: str | None = None, timeout: int = 120) -> str:
         vm = self.machines[vmid]
-        name = next(
-            n
-            for n in ("probe", "report", "finished", "logs", "prepare", "start", "attach", "release", "tidy")
-            if text.endswith(script(n))
-        )
+        built = next((n for n in PROVISION if text.endswith(script(f"{n}.sh", "provision"))), None)
+        if built is not None or not any(text.endswith(script(f"{n}.sh")) for n in GUEST):
+            step = built or "operator"
+            self.scripts.append((vmid, step))
+            if step in self.failing_steps:
+                raise GuestError(f"{step} failed", 1)
+            return f"some output\n{self.runner_version}\n" if step == "finish" else ""
+        name = next(n for n in GUEST if text.endswith(script(f"{n}.sh")))
         self.scripts.append((vmid, name))
         if vm.silent:
             raise GuestError("guest agent not running")
@@ -217,3 +258,30 @@ class FakeCache:
 
     def maintain(self, in_use: set[str]) -> list[str]:
         return []
+
+
+class Script:
+    """Answers host commands from a table keyed by their leading arguments."""
+
+    def __init__(self, answers: dict[tuple[str, ...], Completed | list[Completed]] | None = None) -> None:
+        self.answers = answers or {}
+        self.calls: list[list[str]] = []
+        self.stdin: list[str | None] = []
+
+    def run(self, argv, *, stdin=None, timeout=300):
+        argv = list(argv)
+        self.calls.append(argv)
+        self.stdin.append(stdin)
+        for length in range(len(argv), 0, -1):
+            answer = self.answers.get(tuple(argv[:length]))
+            if answer is not None:
+                return (
+                    answer.pop(0)
+                    if isinstance(answer, list) and len(answer) > 1
+                    else (answer[0] if isinstance(answer, list) else answer)
+                )
+        return Completed(0, "", "")
+
+
+def done(stdout: object = "", code: int = 0, stderr: str = "") -> Completed:
+    return Completed(code, stdout if isinstance(stdout, str) else json.dumps(stdout), stderr)

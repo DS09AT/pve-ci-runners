@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from pve_ci_runners.config import DEFAULT_MOUNTS, check_secret_file, load, parse
+from pve_ci_runners.config import DEFAULT_MOUNTS, MAX_CACHE_DATASET, check_secret_file, load, parse
 from pve_ci_runners.errors import ConfigError
 from tests.conftest import BASE, config_data
 
@@ -248,6 +248,9 @@ backend = "none"
 [template]
 vmids = [9201, 9202]
 storage = "local-zfs"
+image_url = "https://images.example.org/noble-server-cloudimg-amd64.img"
+image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+address = "192.168.100.20"
 """,
         encoding="utf-8",
     )
@@ -270,3 +273,16 @@ def test_secret_files_must_be_private_regular_files(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot be read"):
         check_secret_file(tmp_path / "missing.pem")
     assert os.geteuid() == key.stat().st_uid
+
+
+def test_the_cache_dataset_leaves_room_for_the_longest_derived_zfs_name() -> None:
+    parse(config_data(cache={"backend": "zfs", "dataset": "p/" + "d" * (MAX_CACHE_DATASET - 2)}))
+    with pytest.raises(ConfigError, match="at most"):
+        parse(config_data(cache={"backend": "zfs", "dataset": "p/" + "d" * (MAX_CACHE_DATASET - 1)}))
+
+
+def test_the_example_configuration_is_valid_and_the_readme_shows_it_unchanged() -> None:
+    example = Path("packaging/config.example.toml")
+
+    assert load(example).template.vmids == (9201, 9202)
+    assert example.read_text(encoding="utf-8") in Path("README.md").read_text(encoding="utf-8")

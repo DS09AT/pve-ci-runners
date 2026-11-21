@@ -1,0 +1,18 @@
+#cloud-config
+# First boot of a template build: no accounts and no SSH, only the QEMU guest agent, through which the
+# hypervisor runs the provisioning scripts.
+hostname: ci-runner-template
+manage_etc_hosts: true
+users: []
+disable_root: true
+ssh_pwauth: false
+package_update: true
+package_upgrade: true
+packages:
+  - qemu-guest-agent
+runcmd:
+  - [systemctl, disable, --now, ssh.socket, ssh.service]
+  - [systemctl, mask, ssh.socket, ssh.service]
+  # The isolation probe that runs before any provisioning step fails while IPv6 is enabled.
+  - [sysctl, -qw, net.ipv6.conf.all.disable_ipv6=1, net.ipv6.conf.default.disable_ipv6=1]
+  - [systemctl, enable, --now, qemu-guest-agent]

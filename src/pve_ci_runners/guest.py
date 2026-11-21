@@ -33,9 +33,9 @@ class GuestRunner(Protocol):
 
 
 @cache
-def script(name: str) -> str:
-    """The text of one shipped guest script."""
-    return resources.files("pve_ci_runners").joinpath("guest", f"{name}.sh").read_text(encoding="utf-8")
+def script(name: str, folder: str = "guest") -> str:
+    """The text of one shipped script: a guest step, or a template build step from `provision`."""
+    return resources.files("pve_ci_runners").joinpath(folder, name).read_text(encoding="utf-8")
 
 
 @cache
@@ -43,17 +43,17 @@ def payload_version() -> str:
     """A digest of every guest script; warm VMs prepared with another version are replaced."""
     digest = hashlib.sha256()
     for name in _SCRIPTS:
-        digest.update(script(name).encode())
+        digest.update(script(f"{name}.sh").encode())
     return digest.hexdigest()[:16]
 
 
-def with_inputs(name: str, inputs: Mapping[str, str]) -> str:
+def with_inputs(name: str, inputs: Mapping[str, str], folder: str = "guest") -> str:
     """The script with its inputs assigned in front of it, each value shell-quoted."""
     for key in inputs:
         if re.fullmatch(r"[A-Z][A-Z0-9_]*", key) is None:
             raise ValueError(f"invalid input name {key!r}")
     assignments = "".join(f"{key}={shlex.quote(value)}\n" for key, value in sorted(inputs.items()))
-    return assignments + script(name)
+    return assignments + script(f"{name}.sh", folder)
 
 
 def parse_run_id(report: str) -> int | None:
@@ -105,15 +105,15 @@ class Guest:
 
     def start(self, vmid: int, encoded_config: str) -> None:
         """Hands the single-use configuration to the runner and starts it."""
-        self._runner.guest(vmid, script("start"), stdin=encoded_config)
+        self._runner.guest(vmid, script("start.sh"), stdin=encoded_config)
 
     def started_run(self, vmid: int) -> int | None:
         """The run the runner reports to have taken, once its job started."""
-        return parse_run_id(self._runner.guest(vmid, script("report"), timeout=30))
+        return parse_run_id(self._runner.guest(vmid, script("report.sh"), timeout=30))
 
     def finished(self, vmid: int) -> bool:
         """Whether the runner has exited."""
-        return bool(self._runner.guest(vmid, script("finished"), timeout=30).strip())
+        return bool(self._runner.guest(vmid, script("finished.sh"), timeout=30).strip())
 
     def attach(self, vmid: int) -> None:
         """Mounts the hot-plugged cache disk and lets the waiting job continue."""
@@ -122,7 +122,7 @@ class Guest:
 
     def release(self, vmid: int) -> None:
         """Lets the job continue without a cache."""
-        self._runner.guest(vmid, script("release"), timeout=60)
+        self._runner.guest(vmid, script("release.sh"), timeout=60)
 
     def tidy(self, vmid: int) -> None:
         """Bounds the cache and unmounts it cleanly before it is written back."""
@@ -136,4 +136,4 @@ class Guest:
 
     def logs(self, vmid: int) -> str:
         """The VM's journal and kernel log."""
-        return self._runner.guest(vmid, script("logs"), timeout=60)
+        return self._runner.guest(vmid, script("logs.sh"), timeout=60)

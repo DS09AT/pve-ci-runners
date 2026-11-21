@@ -6,11 +6,13 @@ This is the trust boundary for operator input. Everything downstream receives fr
 import ipaddress
 import json
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from pve_ci_runners.cache import MAX_KEY_LENGTH
 from pve_ci_runners.config_reader import Section
 from pve_ci_runners.errors import ConfigError
 
@@ -28,6 +30,16 @@ VARIABLE = r"[A-Z_][A-Z0-9_]{0,99}"
 # description) or would let a configuration file run code on the host (args, hookscript).
 PROFILE_QM_OPTIONS = frozenset({"cpuunits", "cpulimit", "cpu", "numa", "affinity"})
 DISK_LIMITS = frozenset({"mbps_rd", "mbps_wr", "iops_rd", "iops_wr"})
+STORAGE = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+# What a template build can install; the toolchains sit where the setup-* actions look first.
+TEMPLATE_COMPONENTS = ("docker", "gh", "node", "dotnet", "go", "python")
+TEMPLATE_VERSIONS = {"node": "22.23.5", "go": "1.27.4", "python": "3.12.16", "dotnet": "9.0"}
+_VERSION_PATTERNS = {
+    "node": r"[0-9]+\.[0-9]+\.[0-9]+",
+    "go": r"[0-9]+\.[0-9]+(?:\.[0-9]+)?",
+    "python": r"3\.[0-9]+\.[0-9]+",
+    "dotnet": r"[0-9]+\.[0-9]+|LTS|STS",
+}
 
 # The private and shared ranges the firewall template denies. The runner bridge must lie inside one of
 # them, so the same denial covers the hypervisor's bridge address and every neighbouring VM.
@@ -35,6 +47,10 @@ PRIVATE_RANGES = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/1
 
 # github.com's git-over-SSH ranges (https://api.github.com/meta, "git"); the only SSH egress allowed.
 GITHUB_SSH_RANGES = ("192.30.252.0/22", "185.199.108.0/22", "140.82.112.0/20", "143.55.64.0/20")
+
+# ZFS names hold 255 characters; the longest name the cache derives is
+# <dataset>/jobs/<key>-<vmid>-<stamp>@g<stamp>.
+MAX_CACHE_DATASET = 255 - len("/jobs/") - MAX_KEY_LENGTH - len("-999999999-@g") - 2 * len("99999999999")
 
 
 @dataclass(frozen=True)
@@ -70,6 +86,11 @@ class NetworkConfig:
     def network(self) -> ipaddress.IPv4Network:
         """The subnet the gateway and every slot share."""
         return ipaddress.IPv4Network(f"{self.gateway}/{self.prefix}", strict=False)
+
+    @property
+    def nic(self) -> str:
+        """The `net0` value of every VM on the bridge; the firewall flag makes its rules take effect."""
+        return f"virtio,bridge={self.bridge},firewall=1" + (f",tag={self.vlan}" if self.vlan else "")
 
 
 @dataclass(frozen=True)
@@ -145,10 +166,24 @@ class OverflowConfig:
 
 @dataclass(frozen=True)
 class TemplateConfig:
-    """The two template VMIDs that take turns, and where a build puts its disks."""
+    """How runner templates are built: two VMIDs that take turns, the base image and what goes on it."""
 
     vmids: tuple[int, int]
     storage: str
+    image_url: str
+    image_sha256: str
+    address: ipaddress.IPv4Address
+    snippet_storage: str
+    disk_gb: int
+    cores: int
+    memory_mb: int
+    components: tuple[str, ...]
+    versions: tuple[tuple[str, str], ...]
+    scripts: tuple[PurePosixPath, ...]
+
+    def version(self, component: str) -> str:
+        """The version a component is installed in."""
+        return dict(self.versions)[component]
 
 
 @dataclass(frozen=True)
@@ -425,9 +460,36 @@ def _require_runs_on_json(s: Section, key: str, value: str) -> None:
 
 def _template(s: Section) -> TemplateConfig:
     first, second = s.numbers("vmids", count=2, minimum=100, maximum=999_999_999)
-    result = TemplateConfig(vmids=(first, second), storage=s.text("storage", pattern=r"[A-Za-z0-9_.-]{1,64}"))
+    result = TemplateConfig(
+        vmids=(first, second),
+        storage=s.text("storage", pattern=STORAGE),
+        image_url=s.text("image_url", pattern=r"https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+"),
+        image_sha256=s.text("image_sha256", pattern=r"[0-9a-f]{64}"),
+        address=s.ipv4("address"),
+        snippet_storage=s.text("snippet_storage", default="local", pattern=STORAGE),
+        disk_gb=s.number("disk_gb", default=40, minimum=8, maximum=4096),
+        cores=s.number("cores", default=4, minimum=1, maximum=128),
+        memory_mb=s.number("memory_mb", default=4096, minimum=1024, maximum=262144),
+        components=s.texts("components", default=TEMPLATE_COMPONENTS, pattern="|".join(TEMPLATE_COMPONENTS)),
+        versions=_versions(s),
+        scripts=tuple(
+            PurePosixPath(p) for p in s.texts("scripts", default=(), pattern=r"(?:/[A-Za-z0-9_.-]+)+")
+        ),
+    )
+    if any(".." in path.parts for path in result.scripts):
+        raise s.error("scripts", "paths must not contain '..'")
     s.done()
     return result
+
+
+def _versions(s: Section) -> tuple[tuple[str, str], ...]:
+    given = s.scalars("versions", key_pattern="|".join(TEMPLATE_VERSIONS))
+    result: dict[str, str] = dict(TEMPLATE_VERSIONS)
+    for name, value in given.items():
+        if not isinstance(value, str) or re.fullmatch(_VERSION_PATTERNS[name], value) is None:
+            raise s.error("versions", f"{name}: {value!r} is not a version")
+        result[name] = value
+    return tuple(sorted(result.items()))
 
 
 def _daemon(s: Section | None) -> DaemonConfig:
@@ -454,6 +516,8 @@ def _check(config: Config) -> None:
     _check_profiles(config)
     if config.cache.backend == "zfs" and not config.cache.dataset:
         raise ConfigError("cache.dataset: is required when cache.backend is 'zfs'")
+    if len(config.cache.dataset) > MAX_CACHE_DATASET:
+        raise ConfigError(f"cache.dataset: must be at most {MAX_CACHE_DATASET} characters long")
 
 
 def _check_slots(config: Config) -> None:
@@ -464,14 +528,14 @@ def _check_slots(config: Config) -> None:
     addresses = [s.address for s in config.slots]
     if len(set(addresses)) != len(addresses):
         raise ConfigError("slot: every slot needs its own address")
-    for slot in config.slots:
-        if slot.address not in network or slot.address in {
-            network.network_address,
-            network.broadcast_address,
-        }:
-            raise ConfigError(f"slot {slot.vmid}: {slot.address} is not a host address of {network}")
-        if slot.address == config.network.gateway:
-            raise ConfigError(f"slot {slot.vmid}: {slot.address} is the gateway")
+    if config.template.address in addresses:
+        raise ConfigError("template.address: is a slot's address")
+    named = [(f"slot {s.vmid}", s.address) for s in config.slots] + [("template", config.template.address)]
+    for name, address in named:
+        if address not in network or address in {network.network_address, network.broadcast_address}:
+            raise ConfigError(f"{name}: {address} is not a host address of {network}")
+        if address == config.network.gateway:
+            raise ConfigError(f"{name}: {address} is the gateway")
 
 
 def _check_profiles(config: Config) -> None:

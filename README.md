@@ -51,6 +51,8 @@ time, even while jobs run.
   runner VM's firewall denies.
 - A storage that supports linked clones for the template and the slot VMs (ZFS, LVM-thin or RBD).
 - For the cache: a ZFS pool. Without ZFS the controller runs with `cache.backend = "none"`.
+- A storage with the `snippets` content type (for example `local`), used for cloud-init during template
+  builds, and outbound internet access from the bridge while a template is built.
 - A GitHub App installed on the account or organization whose private repositories should use the runners.
 
 ### GitHub App permissions
@@ -65,22 +67,53 @@ time, even while jobs run.
 
 The App needs no webhook, no user permissions and no organization permissions.
 
+## Install
+
+Each release ships a `.deb` with a SHA-256 sum and a build provenance attestation.
+
+```sh
+sha256sum -c SHA256SUMS
+gh attestation verify pve-ci-runners_*_all.deb --repo DS09AT/pve-ci-runners
+apt install ./pve-ci-runners_*_all.deb
+```
+
+The package enables nothing. Then:
+
+1. Write `/etc/pve-ci-runners/config.toml` (see below) and store the App key as
+   `/etc/pve-ci-runners/app.pem` with mode 0600.
+2. `pve-ci-runners doctor` until every check passes.
+3. `pve-ci-runners template build` for the first template (about 15 minutes).
+4. `systemctl enable --now pve-ci-runners.service pve-ci-runners-template.timer`
+
+A template build downloads the configured cloud image once, checks its pinned SHA-256, boots it behind the
+runner firewall and provisions it through the guest agent: the newest Actions runner (checked against the
+digest GitHub publishes for the release asset), Docker, the GitHub CLI and the Node.js, .NET, Go and Python
+toolchains in the tool cache layout the `setup-*` actions look in first. Your own scripts from
+`template.scripts` run last. The build writes the template VMID that is not in use and marks it finished
+only at the end, so an interrupted build is never cloned. The older template stays until the next build,
+because running VMs may still be linked clones of it.
+
 ## Configuration
 
-`/etc/pve-ci-runners/config.toml`, owned by root. Unknown keys are errors.
+`/etc/pve-ci-runners/config.toml`, owned by root. Unknown keys are errors. The package installs this example
+as `/usr/share/doc/pve-ci-runners/config.example.toml`:
 
 ```toml
+# /etc/pve-ci-runners/config.toml, owned by root with mode 0600. Unknown keys are errors.
+# `pve-ci-runners config check` validates this file; `pve-ci-runners doctor` checks the host against it.
+
 [github]
-owner = "example-org"
+owner = "example-org"                         # the account the GitHub App is installed on
 app_client_id = "Iv23liEXAMPLE"
-app_key_file = "/etc/pve-ci-runners/app.pem"   # mode 0600
+app_key_file = "/etc/pve-ci-runners/app.pem"  # the App's private key, mode 0600
+# repositories = ["example-org/app"]          # serve only these; default: every private repository
 
 [capacity]
 memory_mb = 20480        # all runner VMs together
-host_reserve_mb = 4096   # never start a VM if the host would keep less than this for other guests
+host_reserve_mb = 4096   # never start a VM if the host would keep less than this for its other guests
 
 [network]
-bridge = "vmbr1"
+bridge = "vmbr1"         # a NAT bridge that only runner VMs use
 gateway = "192.168.100.1"
 prefix = 24
 dns = ["192.0.2.53"]
@@ -99,17 +132,30 @@ match = "pve-ci"                       # jobs select this profile with runs-on: 
 labels = ["self-hosted", "linux", "x64", "pve-ci"]
 cores = 4
 memory_mb = 5120
-warm = 1
+warm = 1                               # VMs kept booted and isolated, ready for the next job
 max = 2
 qm_options = { cpuunits = 100 }        # lower CPU priority than the host's other guests
 
 [cache]
-backend = "zfs"
+backend = "zfs"                        # or "none"
 dataset = "rpool/ci-cache"
 
 [template]
 vmids = [9201, 9202]                   # two template VMIDs that take turns
-storage = "local-zfs"
+storage = "local-zfs"                  # where templates and their linked clones live
+address = "192.168.100.20"             # the build VM's address on the bridge
+# A dated cloud image and the SHA-256 published next to it; the build refuses any other bytes.
+image_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260101/ubuntu-24.04-server-cloudimg-amd64.img"
+image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# components = ["docker", "gh", "node", "dotnet", "go", "python"]
+# versions = { node = "22.23.5", go = "1.27.4", python = "3.12.16", dotnet = "9.0" }
+# scripts = ["/etc/pve-ci-runners/provision.d/extra.sh"]   # run as root in the template, root-owned
+
+# [overflow]                           # send jobs to a hosted runner while every slot is busy
+# variable = "CI_RUNS_ON"
+# self_value = '["self-hosted", "pve-ci"]'
+# hosted_value = '"ubuntu-latest"'
+# repositories = ["example-org/app"]
 ```
 
 `pve-ci-runners config check` validates the file and exits; it is safe to use as a configuration
@@ -121,6 +167,8 @@ management `validate` step.
 |---|---|
 | `pve-ci-runners run` | the controller, normally started by systemd |
 | `pve-ci-runners config check` | validates the configuration |
+| `pve-ci-runners doctor` | checks the host and the GitHub App; every failure names its fix |
+| `pve-ci-runners template build` | builds the next runner template; the weekly timer runs it |
 | `pve-ci-runners status [--json]` | what every slot does, read from the host |
 | `pve-ci-runners drain` / `resume` | stop and resume taking new jobs; running jobs finish |
 | `pve-ci-runners version` | prints the version |

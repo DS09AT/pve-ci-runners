@@ -37,6 +37,9 @@ backend = "none"
 [template]
 vmids = [9201, 9202]
 storage = "local-zfs"
+image_url = "https://images.example.org/noble-server-cloudimg-amd64.img"
+image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+address = "192.168.100.20"
 [daemon]
 state_dir = "{state}"
 """

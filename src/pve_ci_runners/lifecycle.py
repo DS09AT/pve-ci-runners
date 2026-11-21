@@ -76,7 +76,11 @@ class Lifecycle:
             return None
         self._guest.prepare(slot.vmid, slot, self.name(slot.vmid))
         if not self._guest.isolated(slot.vmid, self._pve.host_addresses()):
-            self._pve.destroy(slot.vmid)
+            try:
+                self._pve.destroy(slot.vmid)
+            except PveCiError:
+                # The breach must still stop all new work, even when the VM cannot be removed.
+                log.exception("VM %s reached the hypervisor and could not be removed", slot.vmid)
             raise IsolationError(
                 f"VM {slot.vmid} reached the hypervisor; check the datacenter and VM firewall"
             )
@@ -268,15 +272,13 @@ class Lifecycle:
         return state
 
     def _vm_options(self, profile: Profile, state: VmState) -> list[tuple[str, str]]:
-        network = self._config.network
-        net0 = f"virtio,bridge={network.bridge},firewall=1" + (f",tag={network.vlan}" if network.vlan else "")
         return [
             ("onboot", "0"),
             ("tags", TAG),
             ("cores", str(profile.cores)),
             ("memory", str(profile.memory_mb)),
             ("balloon", "0"),
-            ("net0", net0),
+            ("net0", self._config.network.nic),
             *profile.qm_options,
             ("description", state.encode()),
         ]

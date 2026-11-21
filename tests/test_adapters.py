@@ -10,37 +10,11 @@ from pve_ci_runners.config import Config
 from pve_ci_runners.drain import drain, draining, resume
 from pve_ci_runners.errors import CommandError, GuestError
 from pve_ci_runners.logs import prune_logs
-from pve_ci_runners.proc import Completed, HostCommands, output, succeeds
+from pve_ci_runners.proc import HostCommands, output, succeeds
 from pve_ci_runners.pve import Pve
 from pve_ci_runners.state import CacheLease
 from pve_ci_runners.templates import TemplateMarker, current_template, decode_marker
-
-
-class Script:
-    """Answers host commands from a table keyed by their leading arguments."""
-
-    def __init__(self, answers: dict[tuple[str, ...], Completed | list[Completed]] | None = None) -> None:
-        self.answers = answers or {}
-        self.calls: list[list[str]] = []
-        self.stdin: list[str | None] = []
-
-    def run(self, argv, *, stdin=None, timeout=300):
-        argv = list(argv)
-        self.calls.append(argv)
-        self.stdin.append(stdin)
-        for length in range(len(argv), 0, -1):
-            answer = self.answers.get(tuple(argv[:length]))
-            if answer is not None:
-                return (
-                    answer.pop(0)
-                    if isinstance(answer, list) and len(answer) > 1
-                    else (answer[0] if isinstance(answer, list) else answer)
-                )
-        return Completed(0, "", "")
-
-
-def done(stdout: object = "", code: int = 0, stderr: str = "") -> Completed:
-    return Completed(code, stdout if isinstance(stdout, str) else json.dumps(stdout), stderr)
+from tests.fakes import Script, done
 
 
 def test_host_commands_report_exit_status_timeouts_and_missing_tools() -> None:

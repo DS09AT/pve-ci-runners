@@ -1,6 +1,7 @@
 """The two outside systems the controller drives, as the narrow interfaces it depends on."""
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol
 
 from pve_ci_runners.actions import QueuedJob, Registration
@@ -73,6 +74,34 @@ class Hypervisor(Protocol):
         ...
 
 
+class TemplateHypervisor(Hypervisor, Protocol):
+    """The node, with the operations a template build needs on top of a runner VM's."""
+
+    def create(self, vmid: int, options: Sequence[tuple[str, str]]) -> None:
+        """Creates a VM."""
+        ...
+
+    def resize(self, vmid: int, disk: str, size: str) -> None:
+        """Grows a disk."""
+        ...
+
+    def shutdown(self, vmid: int, timeout: int) -> None:
+        """Shuts a VM down and waits until it is off."""
+        ...
+
+    def make_template(self, vmid: int) -> None:
+        """Turns a VM into a template."""
+        ...
+
+    def snippet_path(self, volume: str) -> Path:
+        """The file behind a snippet volume."""
+        ...
+
+    def firewall_enabled(self) -> bool:
+        """Whether the datacenter firewall is on."""
+        ...
+
+
 class GitHubActions(Protocol):
     """The GitHub Actions operations of one App installation."""
 
@@ -110,4 +139,16 @@ class GitHubActions(Protocol):
 
     def set_variable(self, repository: str, name: str, value: str) -> None:
         """Writes a repository Actions variable."""
+        ...
+
+
+class GitHubApp(Protocol):
+    """The App installation itself, for checks of what it was granted."""
+
+    def permissions(self) -> dict[str, str]:
+        """The installation's permissions and their levels."""
+        ...
+
+    def get(self, path: str, *, conditional: bool = False) -> object:
+        """One GET request."""
         ...

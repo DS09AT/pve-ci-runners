@@ -117,3 +117,5 @@ exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
 
 [tool.codespell]
 skip = "*.lock,.git,.venv"
+# nftables (iif) and GnuPG (fpr) keywords.
+ignore-words-list = "iif,fpr"

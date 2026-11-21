@@ -103,6 +103,36 @@ class Pve:
             argv += [f"--{key}", value]
         output(self._commands, argv, timeout=60)
 
+    def create(self, vmid: int, options: Sequence[tuple[str, str]]) -> None:
+        """A new VM; importing a disk image can take minutes."""
+        argv = ["qm", "create", str(vmid)]
+        for key, value in options:
+            argv += [f"--{key}", value]
+        output(self._commands, argv, timeout=1800)
+
+    def resize(self, vmid: int, disk: str, size: str) -> None:
+        """Grows a disk to the given size."""
+        output(self._commands, ["qm", "disk", "resize", str(vmid), disk, size], timeout=300)
+
+    def shutdown(self, vmid: int, timeout: int) -> None:
+        """Shuts a VM down through ACPI and waits until it is off."""
+        output(self._commands, ["qm", "shutdown", str(vmid), "--timeout", str(timeout)], timeout=timeout + 60)
+
+    def make_template(self, vmid: int) -> None:
+        """Turns a stopped VM into a template that linked clones can share."""
+        output(self._commands, ["qm", "template", str(vmid)], timeout=600)
+
+    def firewall_enabled(self) -> bool:
+        """Whether the datacenter firewall is on; without it no VM firewall rule takes effect."""
+        return datacenter_firewall_enabled(self._commands)
+
+    def snippet_path(self, volume: str) -> Path:
+        """Where a snippet volume such as `local:snippets/name.yaml` lives on this node."""
+        path = Path(output(self._commands, ["pvesm", "path", volume], timeout=60).strip())
+        if not path.is_absolute():
+            raise CommandError(f"pvesm path {volume} returned no absolute path")
+        return path
+
     def limit_disk(self, vmid: int, disk: str, limits: Sequence[tuple[str, int]]) -> None:
         """Adds IO limits to an existing disk, keeping its volume and other options."""
         current = str(self.config(vmid).get(disk, ""))
@@ -193,6 +223,19 @@ class Pve:
             return json.loads(output(self._commands, argv, timeout=60))
         except ValueError:
             raise CommandError(f"{' '.join(argv[:3])} returned no JSON") from None
+
+
+def datacenter_firewall_enabled(commands: Commands) -> bool:
+    """Whether the datacenter firewall is on; without it no VM firewall rule takes effect."""
+    try:
+        options = json.loads(
+            output(
+                commands, ["pvesh", "get", "/cluster/firewall/options", "--output-format", "json"], timeout=60
+            )
+        )
+    except ValueError:
+        raise CommandError("pvesh get /cluster/firewall/options returned no JSON") from None
+    return isinstance(options, dict) and cast("dict[str, object]", options).get("enable") == 1
 
 
 def _guest_result(raw: str, vmid: int) -> dict[str, object]:

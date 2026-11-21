@@ -189,6 +189,18 @@ def test_a_vm_that_reaches_the_hypervisor_blocks_all_new_work(setup) -> None:
     )
 
 
+def test_a_breach_blocks_new_work_even_when_the_vm_cannot_be_removed(setup) -> None:
+    config, host, github, cache, clock = setup
+    ctl = controller(config, host, github, cache, clock)
+    ctl.cycle()
+    host.machines[121].isolated = False
+    host.undestroyable.add(121)
+
+    ctl.cycle()
+
+    assert ctl.blocked is not None
+
+
 def test_foreign_and_unnamed_vms_in_a_slot_are_never_touched(setup) -> None:
     config, host, github, cache, clock = setup
     host.machines[121] = FakeVm(name="someone-elses-vm", running=True, tags={TAG})
@@ -335,10 +347,12 @@ def test_a_job_github_recorded_as_ended_is_removed_although_the_guest_stays_sile
 def test_the_runner_exit_marker_lives_where_the_job_user_cannot_write() -> None:
     from pve_ci_runners.guest import script
 
-    assert "install -d -m 0755 -o root -g root /run/ci-runner-state" in script("prepare")
-    assert "ExecStopPost=+/usr/bin/touch /run/ci-runner-state/done" in script("prepare")
+    assert "install -d -m 0755 -o root -g root /run/ci-runner-state" in script("prepare.sh")
+    assert "ExecStopPost=+/usr/bin/touch /run/ci-runner-state/done" in script("prepare.sh")
     for name in ("finished", "report"):
-        assert "/run/ci-runner-state/done" in script(name) and "/run/ci-runner/done" not in script(name)
+        assert "/run/ci-runner-state/done" in script(f"{name}.sh") and "/run/ci-runner/done" not in script(
+            f"{name}.sh"
+        )
 
 
 def finish_job(setup, conclusion: str = "success") -> None:

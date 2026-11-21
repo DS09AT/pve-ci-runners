@@ -130,6 +130,7 @@ class GitHubClient:
     sleep: Callable[[float], None] = time.sleep
     _token: str = field(default="", init=False, repr=False)
     _expires: float = field(default=0.0, init=False)
+    _permissions: dict[str, str] = field(default_factory=dict[str, str], init=False)
     _cache: dict[str, _Cached] = field(default_factory=dict[str, _Cached], init=False, repr=False)
 
     def get(self, path: str, *, conditional: bool = False) -> object:
@@ -201,7 +202,18 @@ class GitHubClient:
             raise GitHubError("GitHub returned no installation token")
         self._token = granted["token"]
         self._expires = dt.datetime.fromisoformat(str(granted["expires_at"])).timestamp()
+        permissions = granted.get("permissions")
+        self._permissions = (
+            {str(k): str(v) for k, v in cast("dict[object, object]", permissions).items()}
+            if isinstance(permissions, dict)
+            else {}
+        )
         return self._token
+
+    def permissions(self) -> dict[str, str]:
+        """What the installation token may do, as GitHub granted it."""
+        self._installation_token()
+        return dict(self._permissions)
 
     def _jwt(self) -> str:
         now = int(self.clock())

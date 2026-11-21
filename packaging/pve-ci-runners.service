@@ -1,0 +1,32 @@
+[Unit]
+Description=pve-ci-runners: GitHub Actions jobs in fresh Proxmox VE VMs
+Documentation=https://github.com/DS09AT/pve-ci-runners
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+ConditionPathExists=/etc/pve-ci-runners/config.toml
+
+[Service]
+ExecStartPre=/usr/bin/pve-ci-runners config check
+ExecStart=/usr/bin/pve-ci-runners run
+Restart=always
+RestartSec=15
+UMask=0077
+StateDirectory=pve-ci-runners
+StateDirectoryMode=0700
+LogsDirectory=pve-ci-runners
+LogsDirectoryMode=0700
+# qm, pvesh and zfs need root, /dev and the cluster file system; everything else is locked down.
+ReadWritePaths=/etc/pve
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

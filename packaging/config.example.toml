@@ -1,0 +1,57 @@
+# /etc/pve-ci-runners/config.toml, owned by root with mode 0600. Unknown keys are errors.
+# `pve-ci-runners config check` validates this file; `pve-ci-runners doctor` checks the host against it.
+
+[github]
+owner = "example-org"                         # the account the GitHub App is installed on
+app_client_id = "Iv23liEXAMPLE"
+app_key_file = "/etc/pve-ci-runners/app.pem"  # the App's private key, mode 0600
+# repositories = ["example-org/app"]          # serve only these; default: every private repository
+
+[capacity]
+memory_mb = 20480        # all runner VMs together
+host_reserve_mb = 4096   # never start a VM if the host would keep less than this for its other guests
+
+[network]
+bridge = "vmbr1"         # a NAT bridge that only runner VMs use
+gateway = "192.168.100.1"
+prefix = 24
+dns = ["192.0.2.53"]
+
+[[slot]]
+vmid = 121
+address = "192.168.100.21"
+
+[[slot]]
+vmid = 122
+address = "192.168.100.22"
+
+[[profile]]
+name = "default"
+match = "pve-ci"                       # jobs select this profile with runs-on: [self-hosted, pve-ci]
+labels = ["self-hosted", "linux", "x64", "pve-ci"]
+cores = 4
+memory_mb = 5120
+warm = 1                               # VMs kept booted and isolated, ready for the next job
+max = 2
+qm_options = { cpuunits = 100 }        # lower CPU priority than the host's other guests
+
+[cache]
+backend = "zfs"                        # or "none"
+dataset = "rpool/ci-cache"
+
+[template]
+vmids = [9201, 9202]                   # two template VMIDs that take turns
+storage = "local-zfs"                  # where templates and their linked clones live
+address = "192.168.100.20"             # the build VM's address on the bridge
+# A dated cloud image and the SHA-256 published next to it; the build refuses any other bytes.
+image_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260101/ubuntu-24.04-server-cloudimg-amd64.img"
+image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# components = ["docker", "gh", "node", "dotnet", "go", "python"]
+# versions = { node = "22.23.5", go = "1.27.4", python = "3.12.16", dotnet = "9.0" }
+# scripts = ["/etc/pve-ci-runners/provision.d/extra.sh"]   # run as root in the template, root-owned
+
+# [overflow]                           # send jobs to a hosted runner while every slot is busy
+# variable = "CI_RUNS_ON"
+# self_value = '["self-hosted", "pve-ci"]'
+# hosted_value = '"ubuntu-latest"'
+# repositories = ["example-org/app"]

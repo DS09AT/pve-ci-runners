@@ -1,15 +1,20 @@
 """The cache a job gets: its key, the backend interface and the backend that keeps nothing."""
 
+from __future__ import annotations
+
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from pve_ci_runners.state import CacheLease
+if TYPE_CHECKING:
+    from pve_ci_runners.state import CacheLease
 
 _UNSAFE = re.compile(r"[^a-z0-9_.-]")
-_READABLE = 60
+_READABLE = 32
 _DIGEST = 32
+# <namespace>-<digest>/<workflow>__<job>-<digest>, each readable part at most _READABLE characters.
+MAX_KEY_LENGTH = (_READABLE + 1 + _DIGEST) + 1 + (2 * _READABLE + 2 + 1 + _DIGEST)
 
 
 def cache_key(repository: str, workflow: str, job: str) -> str:

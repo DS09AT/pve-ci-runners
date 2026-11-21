@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from pve_ci_runners.cache import NoCache, cache_key
+from pve_ci_runners.cache import MAX_KEY_LENGTH, NoCache, cache_key
 from pve_ci_runners.capacity import HostMemory, vms_that_fit
 from pve_ci_runners.config import Config
 from pve_ci_runners.errors import GuestError
@@ -76,7 +76,8 @@ def test_cache_keys_never_collide_after_cleaning_or_truncation() -> None:
     for first, second in pairs:
         assert cache_key(*first) != cache_key(*second)
     for key in (cache_key(long_a, "w" * 300, "j" * 300), cache_key("o/r", "ci.yml", "build")):
-        assert re.fullmatch(r"[a-z0-9_.-]{1,100}/[a-z0-9_.-]{1,170}", key), "fits the stored state"
+        assert re.fullmatch(r"[a-z0-9_.-]{1,65}/[a-z0-9_.-]{1,99}", key), "fits the stored state"
+        assert len(key) <= MAX_KEY_LENGTH
 
 
 def test_only_trusted_default_branch_successes_write_back() -> None:
@@ -196,5 +197,5 @@ def test_a_valid_report_names_its_run() -> None:
 
 def test_every_guest_script_is_strict_bash_and_part_of_the_payload_version() -> None:
     for name in ("prepare", "probe", "start", "report", "finished", "attach", "release", "tidy", "logs"):
-        assert script(name).startswith("#!/bin/bash\n")
+        assert script(f"{name}.sh").startswith("#!/bin/bash\n")
     assert len(payload_version()) == 16

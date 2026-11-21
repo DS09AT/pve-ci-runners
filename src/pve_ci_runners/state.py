@@ -107,7 +107,7 @@ def _state(data: dict[str, object], *, running: bool) -> VmState:
 
 def _lease(data: dict[str, object]) -> CacheLease:
     return CacheLease(
-        key=_text(data, "key", r"[a-z0-9_.-]{1,100}/[a-z0-9_.-]{1,170}"),
+        key=_text(data, "key", r"[a-z0-9_.-]{1,65}/[a-z0-9_.-]{1,99}"),
         clone=_text(data, "clone", _DATASET),
         origin=_text(data, "origin", _DATASET),
     )

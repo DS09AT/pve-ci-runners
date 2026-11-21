@@ -13,6 +13,7 @@ from pve_ci_runners.actions import Actions
 from pve_ci_runners.cache import CacheBackend, NoCache
 from pve_ci_runners.cache_zfs import ZfsCache
 from pve_ci_runners.controller import Controller
+from pve_ci_runners.doctor import Doctor
 from pve_ci_runners.drain import drain, resume
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.github import AppKeySigner, GitHubClient
@@ -20,6 +21,7 @@ from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.proc import HostCommands
 from pve_ci_runners.pve import Pve
 from pve_ci_runners.status import collect
+from pve_ci_runners.template_build import TemplateBuilder
 
 _ATTACH_INTERVAL = 2.0
 log = logging.getLogger("pve_ci_runners")
@@ -54,6 +56,12 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show what every slot does")
     status.add_argument("--json", action="store_true", help="machine-readable output")
     status.set_defaults(handler=_status)
+    commands.add_parser("doctor", help="check the node and the GitHub App").set_defaults(handler=_doctor)
+    template = commands.add_parser("template", help="runner template commands")
+    template_commands = template.add_subparsers(required=True, metavar="action")
+    template_commands.add_parser("build", help="build the next runner template").set_defaults(
+        handler=_build_template
+    )
     commands.add_parser("drain", help="take no new jobs; running jobs finish").set_defaults(handler=_drain)
     commands.add_parser("resume", help="take new jobs again").set_defaults(handler=_resume)
     commands.add_parser("version", help="print the version").set_defaults(handler=_version)
@@ -85,6 +93,22 @@ def _resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor(args: argparse.Namespace) -> int:
+    loaded = configuration.load(args.config)
+    commands = HostCommands()
+    findings = Doctor(loaded, commands, Pve(commands), _client(loaded, commands)).run()
+    for finding in findings:
+        print(finding.to_text())
+    return 1 if any(f.level == "fail" for f in findings) else 0
+
+
+def _build_template(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
+    vmid, version = TemplateBuilder(configuration.load(args.config), Pve(HostCommands())).build()
+    print(f"template {vmid} built with runner {version}")
+    return 0
+
+
 def _version(_: argparse.Namespace) -> int:
     print(VERSION)
     return 0
@@ -95,13 +119,7 @@ def _run(args: argparse.Namespace) -> int:
     loaded = configuration.load(args.config)
     configuration.check_secret_file(loaded.github.app_key_file)
     commands = HostCommands()
-    client = GitHubClient(
-        api_url=loaded.github.api_url,
-        client_id=loaded.github.app_client_id,
-        owner=loaded.github.owner,
-        signer=AppKeySigner(commands, loaded.github.app_key_file),
-    )
-    actions = Actions(client, allowed=loaded.github.repositories)
+    actions = Actions(_client(loaded, commands), allowed=loaded.github.repositories)
     cache: CacheBackend = ZfsCache(loaded.cache, commands) if loaded.cache.backend == "zfs" else NoCache()
     overflow = Overflow(loaded.overflow, actions) if loaded.overflow else None
     controller = Controller(loaded, Pve(commands), actions, cache, overflow=overflow)
@@ -117,6 +135,15 @@ def _run(args: argparse.Namespace) -> int:
         while time.monotonic() < deadline:
             _attach(controller)
             time.sleep(_ATTACH_INTERVAL)
+
+
+def _client(loaded: configuration.Config, commands: HostCommands) -> GitHubClient:
+    return GitHubClient(
+        api_url=loaded.github.api_url,
+        client_id=loaded.github.app_client_id,
+        owner=loaded.github.owner,
+        signer=AppKeySigner(commands, loaded.github.app_key_file),
+    )
 
 
 def _cycle(controller: Controller) -> None:

@@ -29,7 +29,13 @@ BASE: dict[str, Any] = {
         }
     ],
     "cache": {"backend": "zfs", "dataset": "rpool/ci-cache"},
-    "template": {"vmids": [9201, 9202], "storage": "local-zfs"},
+    "template": {
+        "vmids": [9201, 9202],
+        "storage": "local-zfs",
+        "image_url": "https://images.example.org/noble-server-cloudimg-amd64.img",
+        "image_sha256": "0" * 64,
+        "address": "192.168.100.20",
+    },
     "overflow": {
         "variable": "CI_RUNS_ON",
         "hosted_value": '"ubuntu-latest"',
