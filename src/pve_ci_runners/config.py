@@ -257,16 +257,20 @@ def parse(data: dict[str, object]) -> Config:
 
 def check_secret_file(path: Path) -> None:
     """Refuses a key file that someone other than its owner could read or replace."""
-    try:
-        info = path.stat()
-    except OSError as err:
-        raise ConfigError(f"{path}: cannot be read ({err.strerror})") from None
+    info = _stat(path)
     if not stat.S_ISREG(info.st_mode):
         raise ConfigError(f"{path}: must be a regular file")
     if info.st_mode & 0o077:
         raise ConfigError(f"{path}: mode {stat.S_IMODE(info.st_mode):04o} is too open, use 0600")
     if info.st_uid != os.geteuid():
         raise ConfigError(f"{path}: must be owned by the user running the controller")
+
+
+def _stat(path: Path) -> os.stat_result:
+    try:
+        return path.stat()
+    except OSError as err:
+        raise ConfigError(f"{path}: cannot be read ({err.strerror})") from None
 
 
 def _required(root: Section, key: str) -> Section:
@@ -513,15 +517,13 @@ def _daemon(s: Section | None) -> DaemonConfig:
 
 def _check(config: Config) -> None:
     _check_slots(config)
+    _check_addresses(config)
     _check_profiles(config)
-    if config.cache.backend == "zfs" and not config.cache.dataset:
-        raise ConfigError("cache.dataset: is required when cache.backend is 'zfs'")
     if len(config.cache.dataset) > MAX_CACHE_DATASET:
         raise ConfigError(f"cache.dataset: must be at most {MAX_CACHE_DATASET} characters long")
 
 
 def _check_slots(config: Config) -> None:
-    network = config.network.network
     vmids = [s.vmid for s in config.slots] + list(config.template.vmids)
     if len(set(vmids)) != len(vmids):
         raise ConfigError("slot/template: every slot and template needs its own VMID")
@@ -530,6 +532,10 @@ def _check_slots(config: Config) -> None:
         raise ConfigError("slot: every slot needs its own address")
     if config.template.address in addresses:
         raise ConfigError("template.address: is a slot's address")
+
+
+def _check_addresses(config: Config) -> None:
+    network = config.network.network
     named = [(f"slot {s.vmid}", s.address) for s in config.slots] + [("template", config.template.address)]
     for name, address in named:
         if address not in network or address in {network.network_address, network.broadcast_address}:
@@ -539,6 +545,14 @@ def _check_slots(config: Config) -> None:
 
 
 def _check_profiles(config: Config) -> None:
+    _check_match_labels(config)
+    if sum(p.maximum for p in config.profiles) > len(config.slots):
+        raise ConfigError("profile: the sum of 'max' exceeds the number of slots")
+    if sum(p.maximum * p.memory_mb for p in config.profiles) > config.capacity.memory_mb:
+        raise ConfigError("profile: 'max' times 'memory_mb' exceeds capacity.memory_mb")
+
+
+def _check_match_labels(config: Config) -> None:
     names = [p.name for p in config.profiles]
     matches = [p.match for p in config.profiles]
     if len(set(names)) != len(names) or len(set(matches)) != len(matches):
@@ -547,7 +561,3 @@ def _check_profiles(config: Config) -> None:
         others = {p.match for p in config.profiles if p is not profile}
         if others & set(profile.labels):
             raise ConfigError(f"profile {profile.name}: carries another profile's match label")
-    if sum(p.maximum for p in config.profiles) > len(config.slots):
-        raise ConfigError("profile: the sum of 'max' exceeds the number of slots")
-    if sum(p.maximum * p.memory_mb for p in config.profiles) > config.capacity.memory_mb:
-        raise ConfigError("profile: 'max' times 'memory_mb' exceeds capacity.memory_mb")

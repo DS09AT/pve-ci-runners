@@ -38,7 +38,7 @@ jobs:
         run: uv run mypy
       - name: Pre-commit hooks
         env:
-          SKIP: pytest,mypy
+          SKIP: pytest,quality-gate,mypy
         run: uvx --from 'pre-commit==4.3.0' pre-commit run --all-files --show-diff-on-failure
 
   tests:
@@ -57,7 +57,9 @@ jobs:
       - name: Sync the development environment
         run: uv sync --locked --python 3.13
       - name: pytest with branch coverage
-        run: uv run pytest --cov --cov-report=term-missing
+        run: uv run pytest --cov --cov-report=term-missing --cov-report=json
+      - name: Coverage, complexity and CRAP limits
+        run: uv run python scripts/check_quality.py coverage.json
 
   zfs:
     name: ZFS cache backend on a real pool

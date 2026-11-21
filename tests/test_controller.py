@@ -1,14 +1,17 @@
 import json
+import logging
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from pve_ci_runners.cache import cache_key
+from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.config import Config, parse
 from pve_ci_runners.controller import Controller, profile_for
 from pve_ci_runners.drain import drain, reserve
-from pve_ci_runners.errors import CommandError
+from pve_ci_runners.errors import CommandError, GitHubError, GuestError
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.pve import TAG
 from pve_ci_runners.state import VerifiedJob, decode
@@ -165,7 +168,13 @@ def test_the_result_is_awaited_before_a_finished_vm_is_removed(setup) -> None:
 
     ctl.cycle()
     assert 121 in host.machines, "GitHub has not recorded the result yet"
-    clock.now += 200
+    waiting = state(host, 121).done_at
+    clock.now += 100
+    ctl.cycle()
+    assert 121 in host.machines and state(host, 121).done_at == waiting, (
+        "the grace counts from the first miss"
+    )
+    clock.now += 100
     ctl.cycle()
     assert 121 not in host.machines, "after the grace period the VM goes, without writing back"
     assert cache.written == []
@@ -250,6 +259,18 @@ def test_no_vm_is_created_without_a_finished_template(setup) -> None:
     controller(config, host, github, cache, clock).cycle()
 
     assert set(host.machines) == {9201}
+
+
+def test_jobs_without_a_finished_template_count_as_unserved_and_go_to_the_hosted_runner(setup) -> None:
+    config, host, github, cache, clock = setup
+    host.machines[9201].description = "interrupted build"
+    github.queue("example-org/app", count=2)
+    clock.now = 901.0
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201}
+    assert github.variables[("example-org/app", "CI_RUNS_ON")] == '"ubuntu-latest"'
 
 
 def test_warm_vms_of_an_older_payload_are_replaced(setup) -> None:
@@ -601,3 +622,210 @@ def test_runner_vms_start_only_under_the_memory_lock_a_template_build_takes_too(
 
     assert locked == [True]
     assert not holds_memory_lock(config.daemon.state_dir)
+
+
+def warm_vm(setup) -> Controller:
+    """A controller whose VM 121 is warm and VM 122 is not created yet."""
+    ctl = controller(*setup)
+    ctl.cycle()
+    ctl.cycle()
+    assert state(setup[1], 121).phase == "warm"
+    return ctl
+
+
+def test_a_cache_that_cannot_be_attached_leaves_the_job_waiting_for_the_next_poll(setup, caplog) -> None:
+    _, host, github, cache, _ = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app")
+    ctl.cycle()
+    host.machines[121].run_id = 42
+    github.runs[42] = VerifiedJob(42, "build", "ci.yml", "main", "push", same_repository=True, head_sha=HEAD)
+    host.machines[121].silent = True
+
+    ctl.attach_pending()
+
+    assert state(host, 121).cache is None and cache.leases == []
+    assert "VM 121: guest agent not running" in caplog.text
+    host.machines[121].silent = False
+    ctl.attach_pending()
+    assert state(host, 121).cache is not None
+
+
+def test_a_stopped_vm_is_kept_without_lowering_its_priority(setup) -> None:
+    _, host, _, _, _ = setup
+    ctl = controller(*setup)
+    ctl.cycle()
+    host.machines[121].running = False
+    host.unprotectable.add(121)
+
+    ctl.cycle()
+
+    assert "destroy 121" not in host.events
+    assert state(host, 121).phase == "booting"
+
+
+def test_jobs_for_no_profile_are_ignored(setup) -> None:
+    _, host, github, _, _ = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app", labels=("self-hosted", "gpu"))
+
+    ctl.cycle()
+
+    assert state(host, 121).phase == "warm"
+    assert github.registered == {}
+
+
+def test_a_repository_github_cannot_answer_for_does_not_hold_up_the_others(
+    setup, monkeypatch, caplog
+) -> None:
+    _, host, github, _, _ = setup
+    github.repos["example-org/broken"] = "main"
+    queued_jobs = github.queued_jobs
+
+    def failing_queue(repository: str):
+        if repository == "example-org/broken":
+            raise GitHubError("GET /repos/example-org/broken/actions/runs answered 502: bad gateway", 502)
+        return queued_jobs(repository)
+
+    def failing_busy(_repository: str):
+        raise GitHubError("GET /repos/example-org/app/actions/runners answered 502: bad gateway", 502)
+
+    ctl = warm_vm(setup)
+    monkeypatch.setattr(github, "queued_jobs", failing_queue)
+    monkeypatch.setattr(github, "busy_runners", failing_busy)
+    github.queue("example-org/app")
+
+    ctl.cycle()
+    ctl.cycle()
+
+    assert state(host, 121).repository == "example-org/app"
+    assert "example-org/broken: queued jobs unknown" in caplog.text
+    assert "busy runners unknown" in caplog.text
+
+
+def test_a_runner_that_waited_the_idle_timeout_for_a_job_is_retired(setup) -> None:
+    config, host, github, _, clock = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app")
+    ctl.cycle()
+    runner = state(host, 121).runner
+
+    clock.now += config.daemon.idle_timeout_seconds - 1
+    ctl.cycle()
+    assert state(host, 121).phase == "assigned"
+    clock.now += 2
+    ctl.cycle()
+
+    assert "destroy 121" in host.events
+    assert github.removed == [runner]
+
+
+def test_no_vm_starts_when_the_host_filled_up_since_planning(setup, monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    config, host, github, cache, clock = setup
+    answers = iter([host.host_memory(), HostMemory(host.total_mb, host.total_mb)])
+    monkeypatch.setattr(host, "host_memory", lambda: next(answers))
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201}
+    assert "not starting VM 121: the host keeps its reserve" in caplog.text
+
+
+def test_a_vm_that_cannot_be_cloned_does_not_stop_the_next_one(setup, monkeypatch) -> None:
+    config, host, github, cache, clock = setup
+    clone = host.clone
+
+    def failing_clone(template: int, vmid: int, name: str) -> None:
+        if vmid == 121:
+            raise CommandError("qm clone 121 exited 2: storage busy")
+        clone(template, vmid, name)
+
+    monkeypatch.setattr(host, "clone", failing_clone)
+    github.queue("example-org/app", count=2)
+    clock.now = 901.0
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201, 122}
+
+
+def test_without_overflow_no_variable_is_written(setup) -> None:
+    config, host, github, cache, clock = setup
+    host.machines[9201].description = "interrupted build"
+    github.queue("example-org/app", count=2)
+
+    Controller(config, host, github, cache, overflow=None, clock=clock).cycle()
+
+    assert github.variables == {}
+
+
+def test_maintenance_logs_what_it_did_and_a_failure_still_prunes_old_logs(setup, monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    config, host, github, cache, clock = setup
+    old = config.daemon.log_dir / "ci-runner-121.log"
+    old.parent.mkdir(parents=True)
+    old.write_text("x", encoding="utf-8")
+    os.utime(old, (0, 0))
+    monkeypatch.setattr(cache, "maintain", lambda _in_use: ["expired rpool/ci-cache/repos/old"])
+
+    controller(config, host, github, cache, clock).cycle()
+    assert "expired rpool/ci-cache/repos/old" in caplog.text
+    assert old.exists(), "the retention counts from the controller's clock"
+
+    def failing(_in_use: set[str]) -> list[str]:
+        raise CommandError("zfs list exited 1: pool busy")
+
+    monkeypatch.setattr(cache, "maintain", failing)
+    clock.now = config.daemon.log_retention_days * 86400 + 10.0
+    controller(config, host, github, cache, clock).cycle()
+
+    assert "cache maintenance failed: zfs list exited 1: pool busy" in caplog.text
+    assert not old.exists()
+
+
+def test_a_vm_whose_guest_agent_is_not_up_yet_keeps_booting(setup) -> None:
+    _, host, _, _, _ = setup
+    ctl = controller(*setup)
+    ctl.cycle()
+    host.machines[121].agent = False
+
+    ctl.cycle()
+    assert state(host, 121).phase == "booting"
+    assert (121, "prepare") not in host.scripts
+
+    host.machines[121].agent = True
+    ctl.cycle()
+    assert state(host, 121).phase == "warm"
+
+
+def test_a_runner_that_exits_without_a_verified_job_is_removed_and_its_logs_kept(setup) -> None:
+    config, host, github, cache, _ = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app")
+    ctl.cycle()
+    runner = state(host, 121).runner
+    host.machines[121].done = True
+    host.machines[121].journal = "runner crashed"
+
+    ctl.cycle()
+
+    assert 121 not in host.machines
+    assert cache.leases == [] and github.removed == [runner]
+    assert (config.daemon.log_dir / f"{runner}.log").read_text(encoding="utf-8") == "runner crashed"
+
+
+def test_a_cache_the_guest_cannot_tidy_is_not_written_back(setup, monkeypatch) -> None:
+    _, host, github, cache, _ = setup
+    ctl = started_job(setup)
+
+    def fail(_vmid: int) -> None:
+        raise GuestError("guest command exited 1: umount: target is busy")
+
+    monkeypatch.setattr(ctl._lifecycle._guest, "tidy", fail)
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+    ctl.cycle()
+
+    assert 121 not in host.machines
+    assert cache.written == [] and cache.dropped == [KEY]

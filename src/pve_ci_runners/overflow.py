@@ -69,14 +69,17 @@ class Overflow:
         if self._state.on != before:
             lines.append(f"overflow {'on' if self._state.on else 'off'}: {unserved} jobs without a VM")
         value = self._config.hosted_value if self._state.on else self._config.self_value
-        for repository in self._config.repositories:
-            if self._written.get(repository) == value:
-                continue
-            try:
-                self._writer.set_variable(repository, self._config.variable, value)
-            except GitHubError as err:
-                lines.append(f"{repository}: {self._config.variable} not updated: {err}")
-                continue
-            self._written[repository] = value
-            lines.append(f"{repository}: {self._config.variable} = {value}")
+        lines.extend(
+            self._write(repository, value)
+            for repository in self._config.repositories
+            if self._written.get(repository) != value
+        )
         return lines
+
+    def _write(self, repository: str, value: str) -> str:
+        try:
+            self._writer.set_variable(repository, self._config.variable, value)
+        except GitHubError as err:
+            return f"{repository}: {self._config.variable} not updated: {err}"
+        self._written[repository] = value
+        return f"{repository}: {self._config.variable} = {value}"

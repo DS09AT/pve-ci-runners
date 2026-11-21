@@ -102,6 +102,36 @@ def test_a_failed_step_leaves_no_build_vm_and_no_snippet(setup, step: str) -> No
     assert not list(host.snippet_dir.glob("*.yaml"))
 
 
+@pytest.mark.parametrize(("ready_after", "built"), [(2, True), (None, False)])
+def test_a_build_waits_for_the_guest_agent_until_its_timeout(
+    setup, monkeypatch: pytest.MonkeyPatch, ready_after: int | None, built: bool
+) -> None:
+    config, host = setup
+    now = [5000.0]
+    polls: list[int] = []
+
+    def agent_ready(vmid: int) -> bool:
+        polls.append(vmid)
+        return ready_after is not None and len(polls) > ready_after
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(host, "agent_ready", agent_ready)
+    build = TemplateBuilder(
+        config, host, clock=lambda: now[0], sleep=sleep, fetch=lambda *_: Path("/images/noble.img")
+    )
+
+    if built:
+        assert build.build() == (9201, "2.340.1")
+        assert len(polls) == 3
+    else:
+        with pytest.raises(PveCiError, match="did not start its guest agent in time"):
+            build.build()
+        assert 9201 not in host.machines
+        assert now[0] - 5000.0 > 1200
+
+
 def test_a_build_without_a_runner_version_is_not_a_template(setup) -> None:
     config, host = setup
     host.runner_version = "unknown"

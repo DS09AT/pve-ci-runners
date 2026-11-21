@@ -27,18 +27,22 @@ def fetch_image(url: str, sha256: str, directory: Path, *, opener: Opener = _ope
     target = directory / f"{sha256}.img"
     if not (target.is_file() and _digest_of(target) == sha256):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        partial = target.with_suffix(".part")
         log.info("downloading the base image %s", url)
-        try:
-            _download(url, sha256, partial, opener)
-            partial.replace(target)
-        except BaseException:
-            partial.unlink(missing_ok=True)
-            raise
+        _download_to(url, sha256, target, opener)
     for other in directory.glob("*.img"):
         if other != target:
             other.unlink()
     return target
+
+
+def _download_to(url: str, sha256: str, target: Path, opener: Opener) -> None:
+    partial = target.with_suffix(".part")
+    try:
+        _download(url, sha256, partial, opener)
+        partial.replace(target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _download(url: str, sha256: str, partial: Path, opener: Opener) -> None:

@@ -165,15 +165,18 @@ class Actions:
     def remove_runner(self, repository: str, name: str) -> None:
         """Deletes the registration of exactly this name; one that is already gone is not an error."""
         try:
-            answer = _obj(
-                self._api.get(f"/repos/{repository}/actions/runners?name={urllib.parse.quote(name, safe='')}")
-            )
-            for runner in _objs(answer.get("runners")):
-                if runner.get("name") == name:
-                    self._api.delete(f"/repos/{repository}/actions/runners/{_int(runner.get('id'))}")
+            self._delete_runners(repository, name)
         except GitHubError as err:
             if err.status != _HTTP_NOT_FOUND:
                 raise
+
+    def _delete_runners(self, repository: str, name: str) -> None:
+        answer = _obj(
+            self._api.get(f"/repos/{repository}/actions/runners?name={urllib.parse.quote(name, safe='')}")
+        )
+        for runner in _objs(answer.get("runners")):
+            if runner.get("name") == name:
+                self._api.delete(f"/repos/{repository}/actions/runners/{_int(runner.get('id'))}")
 
     def set_variable(self, repository: str, name: str, value: str) -> None:
         """Creates or updates a repository Actions variable."""

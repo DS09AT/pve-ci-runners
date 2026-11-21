@@ -150,15 +150,15 @@ class GitHubClient:
         return self._request("DELETE", path, None)
 
     def _request(self, method: str, path: str, body: object, *, conditional: bool = False) -> object:
-        attempts = _RETRIES if method == "GET" else 1
-        for attempt in range(attempts):
+        retries = _RETRIES - 1 if method == "GET" else 0
+        for attempt in range(retries):
             try:
                 return self._once(method, path, body, conditional=conditional, auth="")
             except GitHubError as err:
-                if attempt == attempts - 1 or not err.transient:
+                if not err.transient:
                     raise
                 self.sleep(2.0**attempt)
-        raise AssertionError("unreachable")
+        return self._once(method, path, body, conditional=conditional, auth="")
 
     def _once(self, method: str, path: str, body: object, *, conditional: bool, auth: str) -> object:
         headers = {
@@ -176,6 +176,9 @@ class GitHubClient:
         answer = self.transport.send(method, self.api_url + path, headers, data)
         if answer.status == _HTTP_NOT_MODIFIED and cached is not None:
             return cached.payload
+        return self._payload(method, path, answer, conditional=conditional)
+
+    def _payload(self, method: str, path: str, answer: Response, *, conditional: bool) -> object:
         if answer.status >= 400:  # noqa: PLR2004 - HTTP client and server errors
             raise GitHubError(
                 f"{method} {path.split('?', 1)[0]} answered {answer.status}: {_reason(answer.body)}",

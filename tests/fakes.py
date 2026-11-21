@@ -88,14 +88,7 @@ class FakeHost:
         vm = self.machines[vmid]
         for key, value in options:
             vm.options[key] = value
-            if key == "description":
-                vm.description = value
-            elif key == "tags":
-                vm.tags = set(value.split(";"))
-            elif key == "memory":
-                vm.memory_mb = int(value)
-            elif key.startswith("scsi"):
-                vm.disks[key] = value
+            _apply_option(vm, key, value)
 
     def limit_disk(self, vmid: int, disk: str, limits) -> None:
         self.machines[vmid].disks[disk] += "".join(f",{k}={v}" for k, v in limits)
@@ -162,13 +155,9 @@ class FakeHost:
     def guest(self, vmid: int, text: str, *, stdin: str | None = None, timeout: int = 120) -> str:
         vm = self.machines[vmid]
         built = next((n for n in PROVISION if text.endswith(script(f"{n}.sh", "provision"))), None)
-        if built is not None or not any(text.endswith(script(f"{n}.sh")) for n in GUEST):
-            step = built or "operator"
-            self.scripts.append((vmid, step))
-            if step in self.failing_steps:
-                raise GuestError(f"{step} failed", 1)
-            return f"some output\n{self.runner_version}\n" if step == "finish" else ""
-        name = next(n for n in GUEST if text.endswith(script(f"{n}.sh")))
+        name = next((n for n in GUEST if text.endswith(script(f"{n}.sh"))), None)
+        if built is not None or name is None:
+            return self._build_step(vmid, built or "operator")
         self.scripts.append((vmid, name))
         if vm.silent:
             raise GuestError("guest agent not running")
@@ -176,11 +165,29 @@ class FakeHost:
             self.probes.append(text)
             if not vm.isolated:
                 raise GuestError("exited 3", 3)
-        if name == "report":
-            return "" if vm.run_id is None or vm.done else json.dumps({"run_id": vm.run_id})
-        if name == "finished":
-            return "{}" if vm.done else ""
-        return vm.journal if name == "logs" else ""
+        answers = {
+            "report": "" if vm.run_id is None or vm.done else json.dumps({"run_id": vm.run_id}),
+            "finished": "{}" if vm.done else "",
+            "logs": vm.journal,
+        }
+        return answers.get(name, "")
+
+    def _build_step(self, vmid: int, step: str) -> str:
+        self.scripts.append((vmid, step))
+        if step in self.failing_steps:
+            raise GuestError(f"{step} failed", 1)
+        return f"some output\n{self.runner_version}\n" if step == "finish" else ""
+
+
+def _apply_option(vm: FakeVm, key: str, value: str) -> None:
+    if key == "description":
+        vm.description = value
+    elif key == "tags":
+        vm.tags = set(value.split(";"))
+    elif key == "memory":
+        vm.memory_mb = int(value)
+    elif key.startswith("scsi"):
+        vm.disks[key] = value
 
 
 class FakeGitHub:

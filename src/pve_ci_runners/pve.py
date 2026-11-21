@@ -206,14 +206,9 @@ class Pve:
         found: list[str] = []
         for link in _dicts(self._json(["ip", "-j", "addr"])):
             for info in _dicts(link.get("addr_info")):
-                if info.get("scope") != "global":
-                    continue
-                try:
-                    address = ipaddress.ip_address(str(info.get("local", "")))
-                except ValueError:
-                    raise CommandError("ip addr listed an invalid address") from None
-                if not address.is_loopback and str(address) not in found:
-                    found.append(str(address))
+                address = _global_address(info)
+                if address is not None and address not in found:
+                    found.append(address)
         if not found:
             raise CommandError("ip addr listed no global address of this node")
         return tuple(found)
@@ -240,24 +235,37 @@ class Pve:
             )
         except CommandError as err:
             raise GuestError(f"VM {vmid}: {err}") from None
-        result = _guest_result(raw, vmid)
-        if result.get("exited") != 1:
-            raise GuestError(f"VM {vmid}: guest command did not finish within {timeout} s")
-        code = result.get("exitcode")
-        if code != 0:
-            tail = _printable(str(result.get("err-data", ""))[-300:])
-            raise GuestError(
-                f"VM {vmid}: guest command exited {code}: {tail}", code if isinstance(code, int) else None
-            )
-        if result.get("out-truncated"):
-            raise GuestError(f"VM {vmid}: guest output was truncated")
-        return str(result.get("out-data", ""))
+        return _guest_output(_guest_result(raw, vmid), vmid, timeout)
 
     def _json(self, argv: list[str]) -> object:
         try:
             return json.loads(output(self._commands, argv, timeout=60))
         except ValueError:
             raise CommandError(f"{' '.join(argv[:3])} returned no JSON") from None
+
+
+def _global_address(info: dict[str, object]) -> str | None:
+    if info.get("scope") != "global":
+        return None
+    try:
+        address = ipaddress.ip_address(str(info.get("local", "")))
+    except ValueError:
+        raise CommandError("ip addr listed an invalid address") from None
+    return None if address.is_loopback else str(address)
+
+
+def _guest_output(result: dict[str, object], vmid: int, timeout: int) -> str:
+    if result.get("exited") != 1:
+        raise GuestError(f"VM {vmid}: guest command did not finish within {timeout} s")
+    code = result.get("exitcode")
+    if code != 0:
+        tail = _printable(str(result.get("err-data", ""))[-300:])
+        raise GuestError(
+            f"VM {vmid}: guest command exited {code}: {tail}", code if isinstance(code, int) else None
+        )
+    if result.get("out-truncated"):
+        raise GuestError(f"VM {vmid}: guest output was truncated")
+    return str(result.get("out-data", ""))
 
 
 def datacenter_firewall_enabled(commands: Commands) -> bool:

@@ -93,6 +93,8 @@ def test_a_ready_node_passes_every_check(config: Config) -> None:
         ),
         (("pvesh", "get", "/cluster/backup"), done([{"id": "vms", "vmid": "100,122"}]), "backup jobs"),
         (("pvesh", "get", "/cluster/firewall/options"), done("not json"), "datacenter firewall"),
+        (("pvesh", "get", "/storage/local"), done("not json"), "snippet storage"),
+        (("pvesh", "get", "/storage/local-zfs"), done(["not", "an", "object"]), "template storage"),
     ],
 )
 def test_each_problem_fails_its_check_with_a_fix(config: Config, command: tuple, answer, check: str) -> None:

@@ -93,7 +93,10 @@ e-mail addresses or local paths. Use placeholders: `example-org`, `pve1`, `vmbr1
 - The controller is tested as a state machine against in-memory fakes of its ports, including a restart in
   the middle of a job.
 - A bug fix starts with a failing test.
-- Coverage must stay at or above 90 % (branch coverage).
+- `scripts/check_quality.py` gates every change in CI and pre-commit: line and branch coverage each at
+  or above 90 %, and per function a cyclomatic complexity and a CRAP score of at most 5, so a function of
+  complexity 5 needs full line and branch coverage. Run it with
+  `uv run pytest --cov --cov-report=json && uv run python scripts/check_quality.py`.
 
 ## Commits and pull requests
 

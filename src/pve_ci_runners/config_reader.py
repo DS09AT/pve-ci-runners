@@ -28,11 +28,6 @@ class Section:
         self._path = path
         self._used: set[str] = set()
 
-    @property
-    def path(self) -> str:
-        """The dotted location of this table, used in error messages."""
-        return self._path
-
     def has(self, key: str) -> bool:
         """Whether the key is present."""
         return key in self._data
@@ -61,13 +56,6 @@ class Section:
             raise self.error(key, f"must be between {minimum} and {maximum}")
         return value
 
-    def flag(self, key: str, *, default: bool | _Missing = MISSING) -> bool:
-        """A boolean."""
-        value = self._get(key, default)
-        if not isinstance(value, bool):
-            raise self.error(key, "must be true or false")
-        return value
-
     def texts(
         self,
         key: str,
@@ -78,24 +66,12 @@ class Section:
         maximum: int = 1000,
     ) -> tuple[str, ...]:
         """A list of strings, each optionally restricted to a pattern; duplicates are an error."""
-        value = self._get(key, default)
-        if isinstance(value, tuple):
-            items = cast("tuple[object, ...]", value)
-        elif isinstance(value, list):
-            items = tuple(cast("list[object]", value))
-        else:
-            raise self.error(key, "must be a list of strings")
+        items = self._items(key, default)
         if not minimum <= len(items) <= maximum:
             raise self.error(key, f"must hold between {minimum} and {maximum} entries")
         result: list[str] = []
         for item in items:
-            if not isinstance(item, str):
-                raise self.error(key, "must be a list of strings")
-            if pattern is not None and re.fullmatch(pattern, item) is None:
-                raise self.error(key, f"{item!r} does not match {pattern}")
-            if item in result:
-                raise self.error(key, f"lists {item!r} twice")
-            result.append(item)
+            self._append_unique(key, result, self._listed_text(key, item, pattern))
         return tuple(result)
 
     def numbers(self, key: str, *, count: int, minimum: int = 0, maximum: int = 2**53) -> tuple[int, ...]:
@@ -110,9 +86,7 @@ class Section:
         for item in items:
             if isinstance(item, bool) or not isinstance(item, int) or not minimum <= item <= maximum:
                 raise self.error(key, f"entries must be integers between {minimum} and {maximum}")
-            if item in result:
-                raise self.error(key, f"lists {item} twice")
-            result.append(item)
+            self._append_unique(key, result, item)
         return tuple(result)
 
     def ipv4(self, key: str, *, default: str | _Missing = MISSING) -> ipaddress.IPv4Address:
@@ -188,6 +162,26 @@ class Section:
         if isinstance(default, _Missing):
             raise self.error(key, "is required")
         return default
+
+    def _items(self, key: str, default: tuple[str, ...] | _Missing) -> tuple[object, ...]:
+        value = self._get(key, default)
+        if isinstance(value, tuple):
+            return cast("tuple[object, ...]", value)
+        if isinstance(value, list):
+            return tuple(cast("list[object]", value))
+        raise self.error(key, "must be a list of strings")
+
+    def _listed_text(self, key: str, item: object, pattern: str | None) -> str:
+        if not isinstance(item, str):
+            raise self.error(key, "must be a list of strings")
+        if pattern is not None and re.fullmatch(pattern, item) is None:
+            raise self.error(key, f"{item!r} does not match {pattern}")
+        return item
+
+    def _append_unique[T](self, key: str, result: list[T], item: T) -> None:
+        if item in result:
+            raise self.error(key, f"lists {item!r} twice")
+        result.append(item)
 
     def _where(self, key: str) -> str:
         return f"{self._path}.{key}" if self._path else key

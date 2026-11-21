@@ -130,22 +130,25 @@ class Controller:
     ) -> dict[int, VmState]:
         result: dict[int, VmState] = {}
         for vmid, state in states.items():
-            try:
-                kept = (
-                    self._advance_one(self._slots[vmid], state, repositories, now)
-                    if self._protected(vmid, state, repositories)
-                    else None
-                )
-            except IsolationError as err:
-                self.blocked = str(err)
-                log.error("%s", err)  # noqa: TRY400 - the reason is the message; a traceback adds nothing
-                continue
-            except PveCiError as err:
-                log.warning("VM %s: %s", vmid, err)
-                kept = state
+            kept = self._advance_guarded(vmid, state, repositories, now)
             if kept is not None:
                 result[vmid] = kept
         return result
+
+    def _advance_guarded(
+        self, vmid: int, state: VmState, repositories: dict[str, str], now: float
+    ) -> VmState | None:
+        try:
+            if not self._protected(vmid, state, repositories):
+                return None
+            return self._advance_one(self._slots[vmid], state, repositories, now)
+        except IsolationError as err:
+            self.blocked = str(err)
+            log.error("%s", err)  # noqa: TRY400 - the reason is the message; a traceback adds nothing
+            return None
+        except PveCiError as err:
+            log.warning("VM %s: %s", vmid, err)
+            return state
 
     def _advance_one(
         self, slot: Slot, state: VmState, repositories: dict[str, str], now: float
@@ -249,7 +252,9 @@ class Controller:
     ) -> dict[str, Plan]:
         held = draining(self._config.daemon.state_dir) or self.blocked is not None
         free = [v for v in self._slots if v not in infos]
-        host = self._pve.host_memory() if free and not held else None
+        # Without a template nothing can start, so the jobs count as unserved and overflow can take them.
+        startable = bool(free) and not held and self._template(infos) is not None
+        host = self._pve.host_memory() if startable else None
         budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
         inputs = []
         for profile in self._config.profiles:
@@ -275,21 +280,24 @@ class Controller:
 
     def _apply(self, plans: dict[str, Plan], states: dict[int, VmState], infos: dict[int, VmInfo]) -> None:
         for plan in plans.values():
-            for vmid in plan.retire:
-                _guarded(vmid, partial(self._lifecycle.retire, vmid, states[vmid], self._repositories))
-            for vmid, repository in plan.assign:
-                _guarded(vmid, partial(self._lifecycle.assign, vmid, states[vmid], repository))
+            self._retire_and_assign(plan, states)
         creations = [(name, vmid) for name, plan in plans.items() for vmid in plan.create]
-        if not creations:
-            return
+        template = self._template(infos) if creations else None
+        if template is not None:
+            self._create(creations, template, infos)
+
+    def _retire_and_assign(self, plan: Plan, states: dict[int, VmState]) -> None:
+        for vmid in plan.retire:
+            _guarded(vmid, partial(self._lifecycle.retire, vmid, states[vmid], self._repositories))
+        for vmid, repository in plan.assign:
+            _guarded(vmid, partial(self._lifecycle.assign, vmid, states[vmid], repository))
+
+    def _template(self, infos: dict[int, VmInfo]) -> int | None:
         template = current_template(self._config.template.vmids, infos, self._description)
         if template is None:
-            log.warning(
-                "no finished template among %s; no VM can be created",
-                self._config.template.vmids,
-            )
-            return
-        self._create(creations, template[0], infos)
+            log.warning("no finished template among %s; no VM can be created", self._config.template.vmids)
+            return None
+        return template[0]
 
     def _create(self, creations: list[tuple[str, int]], template: int, infos: dict[int, VmInfo]) -> None:
         with memory_lock(self._config.daemon.state_dir):

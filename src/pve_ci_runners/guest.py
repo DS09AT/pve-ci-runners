@@ -61,16 +61,20 @@ def parse_run_id(report: str) -> int | None:
     text = report.strip()
     if not text:
         return None
-    if len(text.encode()) > _MAX_REPORT:
-        raise GuestError("the job report is too long")
-    try:
-        data: object = json.loads(text)
-    except (ValueError, RecursionError):
-        raise GuestError("the job report is not JSON") from None
+    data = _report_json(text)
     run_id = data.get("run_id") if isinstance(data, dict) else None
     if isinstance(run_id, bool) or not isinstance(run_id, int) or not 0 < run_id < _MAX_RUN_ID:
         raise GuestError("the job report names no run")
     return run_id
+
+
+def _report_json(text: str) -> object:
+    if len(text.encode()) > _MAX_REPORT:
+        raise GuestError("the job report is too long")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        raise GuestError("the job report is not JSON") from None
 
 
 class Guest:

@@ -42,6 +42,17 @@ Description: GitHub Actions jobs in fresh Proxmox VE virtual machines
  fresh linked-clone VM with a per-job copy-on-write cache. Installing the
  package enables nothing; see /usr/share/doc/pve-ci-runners.
 CONTROL
+# dpkg runs both after the units were added or removed. Without a running systemd, as in a chroot or a
+# container, there is nothing to reload; nothing is ever enabled or started.
+cat >"$root/DEBIAN/postinst" <<'MAINTAINER_SCRIPT'
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+  systemctl --system daemon-reload >/dev/null || true
+fi
+MAINTAINER_SCRIPT
+cp "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
+chmod 0755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
 find "$root" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 deb="pve-ci-runners_${version}_all.deb"

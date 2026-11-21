@@ -248,11 +248,7 @@ def _read_script(path: object, root: Path) -> str:
     """
     file = Path(str(path))
     try:
-        for directory in reversed(file.parents):
-            if directory.is_relative_to(root) and not _private(os.lstat(directory), stat.S_ISDIR):
-                raise PveCiError(
-                    f"{directory}: must be a directory owned by root and writable by no one else"
-                )
+        _check_parents(file, root)
         descriptor = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         raise PveCiError(f"{file}: cannot be read") from None
@@ -260,6 +256,12 @@ def _read_script(path: object, root: Path) -> str:
         if not _private(os.fstat(handle.fileno()), stat.S_ISREG):
             raise PveCiError(f"{file}: must be a regular file owned by root and writable by no one else")
         return handle.read()
+
+
+def _check_parents(file: Path, root: Path) -> None:
+    for directory in reversed(file.parents):
+        if directory.is_relative_to(root) and not _private(os.lstat(directory), stat.S_ISDIR):
+            raise PveCiError(f"{directory}: must be a directory owned by root and writable by no one else")
 
 
 def _private(info: os.stat_result, kind: Callable[[int], bool]) -> bool:

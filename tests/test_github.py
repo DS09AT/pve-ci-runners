@@ -87,6 +87,17 @@ def test_gets_are_retried_on_server_errors_but_writes_are_not() -> None:
     assert err.value.status == 502
 
 
+def test_a_get_that_keeps_failing_raises_after_the_last_retry() -> None:
+    sleeps: list[float] = []
+    api, transport = client({("GET", "/x"): [ok({}, 502), ok({}, 503), ok({"message": "down"}, 504)]}, sleeps)
+
+    with pytest.raises(GitHubError, match="answered 504: down") as err:
+        api.get("/x")
+    assert err.value.transient
+    assert sleeps == [1.0, 2.0]
+    assert [s[1] for s in transport.sent].count("/x") == 3
+
+
 def test_client_errors_are_not_retried_and_never_show_the_token() -> None:
     api, transport = client({("GET", "/x?secret=1"): [ok({"message": "Bad credentials"}, 401)]})
 

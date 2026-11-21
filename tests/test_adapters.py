@@ -167,6 +167,50 @@ def test_vm_operations_call_qm_with_fixed_arguments(tmp_path: Path) -> None:
     ]
 
 
+def test_template_build_operations_call_qm_and_pvesm_with_fixed_arguments() -> None:
+    script = Script({
+        ("pvesm", "path", "local:snippets/a.yaml"): done("/var/lib/vz/snippets/a.yaml\n"),
+        ("pvesh", "get", "/cluster/firewall/options"): done({"enable": 1}),
+    })
+    pve = Pve(script, node="pve1")
+
+    pve.create(9201, [("name", "tpl"), ("memory", "4096")])
+    pve.resize(9201, "scsi0", "40G")
+    pve.shutdown(9201, 120)
+    pve.make_template(9201)
+    assert pve.snippet_path("local:snippets/a.yaml") == Path("/var/lib/vz/snippets/a.yaml")
+    assert pve.firewall_enabled()
+    assert script.calls[:4] == [
+        ["qm", "create", "9201", "--name", "tpl", "--memory", "4096"],
+        ["qm", "disk", "resize", "9201", "scsi0", "40G"],
+        ["qm", "shutdown", "9201", "--timeout", "120"],
+        ["qm", "template", "9201"],
+    ]
+
+
+def test_unexpected_node_answers_are_errors() -> None:
+    pve = Pve(
+        Script({
+            ("pvesm", "path"): done("relative/a.yaml\n"),
+            ("pvesh", "get", "/nodes/pve1/qemu/121/config"): done(["not", "a", "table"]),
+            ("pvesh", "get", "/nodes/pve1/qemu/122/config"): done({"scsi0": "local-zfs:vm-122-disk-0"}),
+            ("pvesh", "get", "/nodes/pve1/qemu"): done({"not": "a list"}),
+            ("qm", "guest", "exec"): done(["not", "an", "object"]),
+        }),
+        node="pve1",
+    )
+
+    with pytest.raises(CommandError, match="no absolute path"):
+        pve.snippet_path("local:snippets/a.yaml")
+    with pytest.raises(CommandError, match="returned no configuration"):
+        pve.config(121)
+    with pytest.raises(CommandError, match="has no disk scsi1"):
+        pve.limit_disk(122, "scsi1", [("mbps_wr", 200)])
+    with pytest.raises(GuestError, match="no JSON object"):
+        pve.guest(121, "true")
+    assert pve.vms() == {}
+
+
 def test_a_started_vm_is_the_first_the_kernel_sacrifices_or_it_is_stopped_again(tmp_path: Path) -> None:
     script = Script()
     (tmp_path / "121.pid").write_text("4242\n", encoding="utf-8")

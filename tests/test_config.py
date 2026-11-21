@@ -286,3 +286,54 @@ def test_the_example_configuration_is_valid_and_the_readme_shows_it_unchanged() 
 
     assert load(example).template.vmids == (9201, 9202)
     assert example.read_text(encoding="utf-8") in Path("README.md").read_text(encoding="utf-8")
+
+
+def test_a_secret_file_owned_by_another_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path / "app.pem"
+    key.write_text("x", encoding="utf-8")
+    key.chmod(0o600)
+    monkeypatch.setattr(os, "geteuid", lambda: key.stat().st_uid + 1)
+
+    with pytest.raises(ConfigError, match="must be owned by the user running the controller"):
+        check_secret_file(key)
+
+
+def test_disk_limits_are_positive_integers() -> None:
+    data = config_data()
+    data["profile"][0]["disk_limits"] = {"mbps_wr": 200, "iops_rd": 500}
+    assert parse(data).profiles[0].disk_limits == (("iops_rd", 500), ("mbps_wr", 200))
+
+    for value in (0, "fast"):
+        data["profile"][0]["disk_limits"] = {"mbps_wr": value}
+        with pytest.raises(ConfigError, match=r"disk_limits\.mbps_wr: must be a positive integer"):
+            parse(data)
+
+
+def test_template_versions_override_the_defaults_and_must_look_like_versions() -> None:
+    data = config_data()
+    data["template"]["versions"] = {"node": "24.1.0", "dotnet": "LTS"}
+    versions = dict(parse(data).template.versions)
+    assert (versions["node"], versions["dotnet"], versions["go"]) == ("24.1.0", "LTS", "1.27.4")
+
+    for value in ("latest", 24):
+        data["template"]["versions"] = {"node": value}
+        with pytest.raises(ConfigError, match=r"node: .* is not a version"):
+            parse(data)
+
+
+def test_template_scripts_cannot_climb_out_of_their_directory() -> None:
+    data = config_data()
+    data["template"]["scripts"] = ["/etc/pve-ci-runners/../shadow"]
+
+    with pytest.raises(ConfigError, match=r"must not contain '\.\.'"):
+        parse(data)
+
+
+def test_the_template_needs_an_address_of_its_own() -> None:
+    data = config_data()
+    data["template"]["address"] = data["slot"][0]["address"]
+
+    with pytest.raises(ConfigError, match=r"template\.address: is a slot's address"):
+        parse(data)

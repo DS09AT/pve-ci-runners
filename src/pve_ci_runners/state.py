@@ -73,16 +73,21 @@ class VmState:
 
 def decode(description: str, *, running: bool) -> VmState | None:
     """The state stored in a description, or None when it is not a valid state of this controller."""
-    try:
-        data = json.loads(description)
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
+    data = _json_object(description)
+    if data is None:
         return None
     try:
-        return _state(cast("dict[str, object]", data), running=running)
+        return _state(data, running=running)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _json_object(text: str) -> dict[str, object] | None:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return cast("dict[str, object]", data) if isinstance(data, dict) else None
 
 
 def _state(data: dict[str, object], *, running: bool) -> VmState:

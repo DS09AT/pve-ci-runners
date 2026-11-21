@@ -32,6 +32,7 @@ packages = ["src/pve_ci_runners"]
 
 [dependency-groups]
 dev = [
+  "mccabe>=0.7.0",
   "mypy>=1.18",
   "pytest>=8.4",
   "pytest-cov>=7.0",
@@ -50,7 +51,7 @@ select = [
   "E", "F", "W", "I", "B", "UP", "SIM", "PL", "RUF", "ANN", "ARG", "C4", "DTZ",
   "ERA", "FBT", "ICN", "ISC", "PIE", "PT", "Q", "RET", "T20", "TC", "TRY",
   "S", "BLE", "LOG", "G", "PERF", "PTH", "SLF", "EM", "N", "INP", "FURB",
-  "TID", "RSE", "D",
+  "TID", "RSE", "D", "C90",
 ]
 # Messages stay at the raise site (EM101/EM102): one place to read what failed and why.
 # Rule codes are kept in selectors (RUF201): they match the codes in noqa comments and ruff output.
@@ -71,7 +72,7 @@ max-nested-blocks = 3
 max-bool-expr = 4
 
 [tool.ruff.lint.mccabe]
-max-complexity = 9
+max-complexity = 5
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -85,6 +86,8 @@ ban-relative-imports = "all"
 # One typed reader method per value kind keeps every schema rule in one place.
 "src/pve_ci_runners/config_reader.py" = ["PLR0904"]
 "src/pve_ci_runners/cli.py" = ["T20"]
+# Development scripts run from a checkout, not as an installed package, and report on standard output.
+"scripts/**" = ["INP001", "T20"]
 # Tests use fakes with unused parameters, seeded randomness, real bash calls and compact assertions.
 "tests/**" = [
   "S101", "D", "PLR2004", "PLR6301", "ANN", "SLF001", "FBT001", "FBT002", "FBT003", "INP001", "S105", "S106",

@@ -154,14 +154,16 @@ class Lifecycle:
                 return False
         if conclusion != "success":
             self._keep_logs(vmid, state)
-        keep = self._should_keep(vmid, state, conclusion, default_branch)
-        if keep:
-            try:
-                self._guest.tidy(vmid)
-            except PveCiError as err:
-                log.warning("VM %s: cache not tidied, not written back: %s", vmid, err)
-                keep = False
+        keep = self._should_keep(vmid, state, conclusion, default_branch) and self._tidied(vmid)
         self._remove(vmid, state, repositories, write_back=keep)
+        return True
+
+    def _tidied(self, vmid: int) -> bool:
+        try:
+            self._guest.tidy(vmid)
+        except PveCiError as err:
+            log.warning("VM %s: cache not tidied, not written back: %s", vmid, err)
+            return False
         return True
 
     def finished(self, vmid: int) -> bool:
