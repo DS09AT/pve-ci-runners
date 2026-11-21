@@ -13,7 +13,7 @@ from pve_ci_runners.actions import Actions
 from pve_ci_runners.cache import CacheBackend, NoCache
 from pve_ci_runners.cache_zfs import ZfsCache
 from pve_ci_runners.controller import Controller
-from pve_ci_runners.doctor import Doctor
+from pve_ci_runners.doctor import Doctor, report_json
 from pve_ci_runners.drain import drain, resume
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.github import AppKeySigner, GitHubClient
@@ -56,7 +56,9 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show what every slot does")
     status.add_argument("--json", action="store_true", help="machine-readable output")
     status.set_defaults(handler=_status)
-    commands.add_parser("doctor", help="check the node and the GitHub App").set_defaults(handler=_doctor)
+    doctor = commands.add_parser("doctor", help="check the node and the GitHub App")
+    doctor.add_argument("--json", action="store_true", help="machine-readable output")
+    doctor.set_defaults(handler=_doctor)
     template = commands.add_parser("template", help="runner template commands")
     template_commands = template.add_subparsers(required=True, metavar="action")
     template_commands.add_parser("build", help="build the next runner template").set_defaults(
@@ -99,8 +101,7 @@ def _doctor(args: argparse.Namespace) -> int:
     loaded = configuration.load(args.config)
     commands = HostCommands()
     findings = Doctor(loaded, commands, Pve(commands), _client(loaded, commands)).run()
-    for finding in findings:
-        print(finding.to_text())
+    print(report_json(findings) if args.json else "\n".join(f.to_text() for f in findings))
     return 1 if any(f.level == "fail" for f in findings) else 0
 
 

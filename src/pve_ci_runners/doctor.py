@@ -5,6 +5,7 @@ a runner VM stops its removal, and a missing App permission fails jobs only at r
 is cheaper to find here than in a failed job.
 """
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
@@ -40,6 +41,15 @@ class Finding:
         """One line, and the fix below it when there is one."""
         line = f"{self.level.upper():<5} {self.check}: {self.detail}"
         return f"{line}\n      fix: {self.fix}" if self.fix else line
+
+
+def report_json(findings: list[Finding]) -> str:
+    """The findings as a versioned JSON document for configuration management."""
+    return json.dumps(
+        {"schema_version": "1", "findings": [dataclasses.asdict(f) for f in findings]},
+        indent=2,
+        sort_keys=True,
+    )
 
 
 class Doctor:

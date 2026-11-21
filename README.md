@@ -170,7 +170,7 @@ management `validate` step.
 |---|---|
 | `pve-ci-runners run` | the controller, normally started by systemd |
 | `pve-ci-runners config check` | validates the configuration |
-| `pve-ci-runners doctor` | checks the host and the GitHub App; every failure names its fix |
+| `pve-ci-runners doctor [--json]` | checks the host and the GitHub App; every failure names its fix |
 | `pve-ci-runners template build` | builds the next runner template; the weekly timer runs it |
 | `pve-ci-runners status [--json]` | what every slot does, read from the host |
 | `pve-ci-runners drain` / `resume` | stop and resume taking new jobs; idle VMs are released, running jobs finish |

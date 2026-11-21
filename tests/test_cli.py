@@ -126,6 +126,17 @@ def test_doctor_prints_every_finding_and_fails_on_a_failed_check(
     findings.append(Finding("fail", "template", "no finished template"))
     assert cli.main(["-c", str(config_file), "doctor"]) == 1
 
+    capsys.readouterr()
+    assert cli.main(["-c", str(config_file), "doctor", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == "1"
+    assert report["findings"][2] == {
+        "level": "fail",
+        "check": "template",
+        "detail": "no finished template",
+        "fix": "",
+    }
+
 
 def with_app_key(config_file: Path, mode: int) -> None:
     key = config_file.parent / "app.pem"
