@@ -1,0 +1,100 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# Runs are serialised, not cancelled: an interrupted run could leave a tag without its package.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release pull request and tag
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # create the tag and the GitHub release, update the release branch
+      pull-requests: write # open and update the release pull request
+    timeout-minutes: 10
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      # The version in uv.lock and in _version.py moves with pyproject.toml through extra-files, so this
+      # job never runs project tooling while it holds write access.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The tests install third-party development tools, so they run in a job without write access; the job
+  # that can sign and publish runs only first-party build steps on the system Python.
+  test:
+    name: Tests
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Sync the development environment
+        run: uv sync --locked --python 3.13
+      - name: pytest
+        run: uv run pytest -q
+
+  publish:
+    name: Build, attest and attach the package
+    needs: [release-please, test]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # attach the package to the release
+      id-token: write # sign the provenance attestation
+      attestations: write
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.release-please.outputs.tag }}
+      SHA: ${{ needs.release-please.outputs.sha }}
+    steps:
+      - name: The tag is a plain version and the commit a full SHA
+        run: '[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$SHA" =~ ^[0-9a-f]{40}$ ]]'
+      # Checked out by the commit release-please tagged, not by the tag name, which anyone with write
+      # access could move; the build then must match the tag and lie on main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The commit is the tagged one and part of main
+        run: |
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SHA"
+          git merge-base --is-ancestor "$SHA" refs/remotes/origin/main
+      - name: The tag names the package version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "v$version" = "$TAG"
+      - name: Build
+        run: packaging/build-deb.sh
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.deb
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/*.deb dist/SHA256SUMS

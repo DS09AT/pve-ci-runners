@@ -1,0 +1,71 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "pve-ci-runners",
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
+      "include-component-in-tag": false,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "src/pve_ci_runners/_version.py"
+        },
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='pve-ci-runners')].version"
+        }
+      ]
+    }
+  },
+  "changelog-sections": [
+    {
+      "type": "feat",
+      "section": "Features"
+    },
+    {
+      "type": "fix",
+      "section": "Bug Fixes"
+    },
+    {
+      "type": "perf",
+      "section": "Performance Improvements"
+    },
+    {
+      "type": "revert",
+      "section": "Reverts"
+    },
+    {
+      "type": "docs",
+      "section": "Documentation"
+    },
+    {
+      "type": "style",
+      "section": "Styles"
+    },
+    {
+      "type": "refactor",
+      "section": "Code Refactoring"
+    },
+    {
+      "type": "test",
+      "section": "Tests"
+    },
+    {
+      "type": "build",
+      "section": "Build System"
+    },
+    {
+      "type": "ci",
+      "section": "Continuous Integration"
+    },
+    {
+      "type": "chore",
+      "section": "Miscellaneous Chores",
+      "hidden": true
+    }
+  ]
+}
