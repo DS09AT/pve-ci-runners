@@ -9,7 +9,6 @@ every later entry is generated from [Conventional Commits](https://www.conventio
 
 ### Bug Fixes
 
-* keep the memory of every other guest free, running or not ([8a6b995](https://github.com/DS09AT/pve-ci-runners/commit/8a6b99525c2ec623bdd98b8de494bde5eb0a8274))
 * keep the memory of every other guest free, running or not ([698530f](https://github.com/DS09AT/pve-ci-runners/commit/698530f74b0a06d6a39dd63e67b55659edcb11c3))
 
 ## [0.2.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.0...v0.2.1) (2026-11-21)
