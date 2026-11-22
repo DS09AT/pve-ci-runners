@@ -12,7 +12,7 @@ from pve_ci_runners.drain import drain, draining, reserve, reserved_mb, resume
 from pve_ci_runners.errors import CommandError, GuestError
 from pve_ci_runners.logs import prune_logs
 from pve_ci_runners.proc import HostCommands, output, succeeds
-from pve_ci_runners.pve import Pve
+from pve_ci_runners.pve import Pve, datacenter_firewall_enabled
 from pve_ci_runners.state import CacheLease
 from pve_ci_runners.templates import TemplateMarker, current_template, decode_marker
 from tests.fakes import Script, done
@@ -265,7 +265,7 @@ def test_vm_operations_call_qm_with_fixed_arguments(tmp_path: Path) -> None:
 def test_template_build_operations_call_qm_and_pvesm_with_fixed_arguments() -> None:
     script = Script({
         ("pvesm", "path", "local:snippets/a.yaml"): done("/var/lib/vz/snippets/a.yaml\n"),
-        ("pvesh", "get", "/cluster/firewall/options"): done({"enable": 1}),
+        ("cat", "/etc/pve/firewall/cluster.fw"): done("[OPTIONS]\npolicy_in: DROP\nenable: 1\n"),
     })
     pve = Pve(script, node="pve1")
 
@@ -630,3 +630,19 @@ def test_the_newest_finished_template_wins() -> None:
     assert current_template((9201, 9202), {}, marks.__getitem__) is None
     for text in ("", "[]", json.dumps({"kind": "other", "built_at": 1, "runner_version": "x"})):
         assert decode_marker(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "enabled"),
+    [
+        ("[OPTIONS]\nenable: 1\n", True),
+        ("[OPTIONS]\nenable:0\n", False),
+        ("[OPTIONS]\npolicy_in: DROP\n\n[RULES]\nenable: 1\n", False),
+        ("[OPTIONS]\nenable: 1\nenable: 0\n", False),
+        ("", False),
+    ],
+)
+def test_the_datacenter_firewall_option_is_read_from_cluster_fw(text: str, enabled: bool) -> None:
+    script = Script({("cat", "/etc/pve/firewall/cluster.fw"): done(text)})
+
+    assert datacenter_firewall_enabled(script) is enabled
