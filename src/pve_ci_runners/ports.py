@@ -1,6 +1,6 @@
 """The two outside systems the controller drives, as the narrow interfaces it depends on."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -21,8 +21,11 @@ class Hypervisor(Protocol):
         """One VM's configuration."""
         ...
 
-    def host_memory(self) -> HostMemory:
-        """Physical memory and the memory promised to running guests."""
+    def host_memory(self, excluded: Mapping[int, str]) -> HostMemory:
+        """Physical memory and the memory configured for every guest, running or not.
+
+        A VM is left out only if its VMID maps to its name in `excluded` and it carries our tag.
+        """
         ...
 
     def set_description(self, vmid: int, text: str) -> None:

@@ -1,7 +1,8 @@
 [Unit]
 Description=pve-ci-runners: build the next runner template
 Documentation=https://github.com/DS09AT/pve-ci-runners
-After=network-online.target pve-cluster.service
+# Behind the onboot guests, so the first round does not race their start for memory or qm locks.
+After=network-online.target pve-cluster.service pve-guests.service
 Wants=network-online.target
 ConditionPathExists=/etc/pve-ci-runners/config.toml
 

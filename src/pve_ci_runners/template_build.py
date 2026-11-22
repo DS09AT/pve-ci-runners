@@ -16,7 +16,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from pve_ci_runners.capacity import HostMemory, vms_that_fit
+from pve_ci_runners.capacity import vms_that_fit
 from pve_ci_runners.config import Config, Slot
 from pve_ci_runners.drain import drain, draining, memory_lock, release, reserve, resume
 from pve_ci_runners.errors import PveCiError
@@ -26,7 +26,7 @@ from pve_ci_runners.images import fetch_image
 from pve_ci_runners.lifecycle import IsolationError
 from pve_ci_runners.ports import TemplateHypervisor
 from pve_ci_runners.pve import TAG
-from pve_ci_runners.templates import TemplateMarker, current_template
+from pve_ci_runners.templates import TemplateMarker, build_vm_name, current_template
 
 _PROVISION = "provision"
 _VERSIONED = frozenset({"node", "dotnet", "go", "python"})
@@ -73,14 +73,14 @@ class TemplateBuilder:
             snippet = self._host.snippet_path(self._snippet(vmid))
             snippet.write_text(script("user-data.yaml", _PROVISION), encoding="utf-8")
             try:
-                with self._room():
+                with self._room(vmid):
                     version = self._build_vm(vmid, image, scripts)
             finally:
                 snippet.unlink(missing_ok=True)
             return vmid, version
 
     @contextmanager
-    def _room(self) -> Generator[None]:
+    def _room(self, vmid: int) -> Generator[None]:
         """Holds memory for the build VM, and drains the runners until the host has that much to spare.
 
         The reservation keeps the controller from starting runner VMs into the memory the build needs;
@@ -91,7 +91,7 @@ class TemplateBuilder:
         drained = False
         try:
             deadline = self._clock() + _ROOM_TIMEOUT
-            while not self._fits():
+            while not self._fits(vmid):
                 if not drained and not draining(state_dir):
                     log.info("draining the runners to make room for the build VM")
                     drain(state_dir)
@@ -105,15 +105,14 @@ class TemplateBuilder:
                 resume(state_dir)
             release(state_dir)
 
-    def _fits(self) -> bool:
+    def _fits(self, vmid: int) -> bool:
         capacity, slots = self._config.capacity, {s.vmid for s in self._config.slots}
         runners = [info for vmid, info in self._host.vms().items() if vmid in slots]
-        host = self._host.host_memory()
-        # A slot VM that is not running yet is about to boot; its memory is already promised.
-        booting = sum(info.memory_mb for info in runners if not info.running)
+        # The build VM is left out: vm_mb counts it here, the reservation does for the controller.
+        host = self._host.host_memory({vmid: self._name(vmid)})
         return (
             vms_that_fit(
-                HostMemory(host.total_mb, host.committed_mb + booting),
+                host,
                 reserve_mb=capacity.host_reserve_mb,
                 budget_left_mb=capacity.memory_mb - sum(info.memory_mb for info in runners),
                 vm_mb=self._config.template.memory_mb,
@@ -136,7 +135,7 @@ class TemplateBuilder:
         return version
 
     def _name(self, vmid: int) -> str:
-        return f"{self._config.daemon.name_prefix}template-{vmid}"
+        return build_vm_name(self._config.daemon.name_prefix, vmid)
 
     def _snippet(self, vmid: int) -> str:
         return f"{self._config.template.snippet_storage}:snippets/pve-ci-runners-build-{vmid}.yaml"
@@ -195,7 +194,7 @@ class TemplateBuilder:
         self._host.resize(vmid, "scsi0", f"{template.disk_gb}G")
         # Checked again: runner VMs may have started while the image was imported.
         with memory_lock(self._config.daemon.state_dir):
-            if not self._fits():
+            if not self._fits(vmid):
                 raise PveCiError(_NO_ROOM)
             self._host.start(vmid)
         deadline = self._clock() + _AGENT_TIMEOUT

@@ -164,6 +164,11 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 `pve-ci-runners config check` validates the file and exits; it is safe to use as a configuration
 management `validate` step.
 
+`capacity.host_reserve_mb` is kept free on top of the memory configured for every other guest on the node,
+running or not, because a stopped VM may boot at any moment and runner VMs give way to it.
+`pve-ci-runners doctor` fails its `guest memory` check when the physical memory cannot hold those guests,
+the reserve and `capacity.memory_mb` together.
+
 ## Commands
 
 | Command | What it does |

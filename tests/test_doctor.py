@@ -4,6 +4,7 @@ import pytest
 
 from pve_ci_runners.config import Config, parse
 from pve_ci_runners.doctor import Doctor, Finding
+from pve_ci_runners.drain import reserve
 from pve_ci_runners.pve import TAG
 from tests.conftest import config_data
 from tests.fakes import FakeHost, FakeVm, Script, done
@@ -50,7 +51,8 @@ def config(tmp_path: Path) -> Config:
     key.chmod(0o600)
     return parse(
         config_data(
-            github={"owner": "example-org", "app_client_id": "Iv23liEXAMPLE", "app_key_file": str(key)}
+            github={"owner": "example-org", "app_client_id": "Iv23liEXAMPLE", "app_key_file": str(key)},
+            daemon={"state_dir": str(tmp_path / "state"), "log_dir": str(tmp_path / "log")},
         )
     )
 
@@ -206,6 +208,41 @@ def test_a_fix_keeps_the_values_already_set(
     findings = run(config, {**HEALTHY, command: answer})
 
     assert findings[check].level == "fail" and findings[check].fix == fix
+
+
+@pytest.mark.parametrize(("spare_mb", "level"), [(0, "ok"), (-1, "fail")])
+def test_guest_memory_counts_every_other_guest_running_or_not(
+    config: Config, spare_mb: int, level: str
+) -> None:
+    host = FakeHost(other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[100] = FakeVm(name="windows", memory_mb=16000)
+    host.machines[121] = FakeVm(name="ci-runner-121", memory_mb=5120, tags={TAG})
+    host.machines[9202] = FakeVm(name="ci-runner-template-9202", memory_mb=4096, tags={TAG})
+    reserve(config.daemon.state_dir, 4096)
+    host.total_mb = 20480 + 4096 + 16000 + spare_mb
+
+    finding = run(config, HEALTHY, host)["guest memory"]
+
+    assert finding.level == level
+    assert "capacity.memory_mb 20480 + capacity.host_reserve_mb 4096 + 16000 MiB" in finding.detail
+    if level == "fail":
+        assert "40575 MiB do not cover" in finding.detail and "= 40576 MiB" in finding.detail
+        assert "by 1 MiB" in finding.fix and "stopped guests" in finding.fix
+
+
+def test_guest_memory_counts_a_build_vm_without_a_reservation_and_foreign_vms_on_our_vmids(
+    config: Config,
+) -> None:
+    host = FakeHost(other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[121] = FakeVm(name="windows", memory_mb=5120)
+    host.machines[9202] = FakeVm(name="ci-runner-template-9202", memory_mb=4096, tags={TAG})
+    host.total_mb = 20480 + 4096 + 5120 + 4096
+
+    finding = run(config, HEALTHY, host)["guest memory"]
+
+    assert finding.level == "ok" and "+ 9216 MiB configured" in finding.detail
 
 
 def test_a_reserve_that_does_not_cover_the_zfs_arc_is_a_warning(config: Config) -> None:
