@@ -81,6 +81,7 @@ class NetworkConfig:
     prefix: int
     dns: tuple[ipaddress.IPv4Address, ...]
     vlan: int | None
+    rate: int | None
 
     @property
     def network(self) -> ipaddress.IPv4Network:
@@ -90,7 +91,9 @@ class NetworkConfig:
     @property
     def nic(self) -> str:
         """The `net0` value of every VM on the bridge; the firewall flag makes its rules take effect."""
-        return f"virtio,bridge={self.bridge},firewall=1" + (f",tag={self.vlan}" if self.vlan else "")
+        tag = f",tag={self.vlan}" if self.vlan else ""
+        rate = f",rate={self.rate}" if self.rate else ""
+        return f"virtio,bridge={self.bridge},firewall=1{tag}{rate}"
 
 
 @dataclass(frozen=True)
@@ -144,10 +147,11 @@ class CacheConfig:
 
 @dataclass(frozen=True)
 class FirewallConfig:
-    """Extra egress rules on top of the deny-by-default template."""
+    """Extra egress rules and denied destinations on top of the deny-by-default template."""
 
     ssh_destinations: tuple[str, ...]
     extra_rules: tuple[str, ...]
+    deny_destinations: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -313,6 +317,8 @@ def _network(s: Section) -> NetworkConfig:
             ipaddress.IPv4Address(d) for d in s.texts("dns", minimum=1, maximum=3, pattern=r"[0-9.]{7,15}")
         ),
         vlan=s.number("vlan", minimum=1, maximum=4094) if s.has("vlan") else None,
+        # Proxmox takes the NIC rate limit in MB/s.
+        rate=s.number("rate", minimum=1, maximum=100_000) if s.has("rate") else None,
     )
     s.done()
     if not any(result.network.subnet_of(ipaddress.IPv4Network(r)) for r in PRIVATE_RANGES):
@@ -420,10 +426,25 @@ def _firewall(s: Section | None) -> FirewallConfig:
             raise s.error("ssh_destinations", f"{cidr!r} is not an IPv4 network") from None
     rule = r"(IN|OUT) (ACCEPT|DROP|REJECT)( -[a-z-]+ [A-Za-z0-9.,:/_-]+)*( # [ -~]{0,80})?"
     result = FirewallConfig(
-        ssh_destinations=destinations, extra_rules=s.texts("extra_rules", default=(), pattern=rule)
+        ssh_destinations=destinations,
+        extra_rules=s.texts("extra_rules", default=(), pattern=rule),
+        deny_destinations=_networks(s, "deny_destinations"),
     )
     s.done()
     return result
+
+
+def _networks(s: Section, key: str) -> tuple[str, ...]:
+    """IPv4 and IPv6 networks in their normal form, each once."""
+    networks: list[str] = []
+    for cidr in s.texts(key, default=(), maximum=256):
+        try:
+            network = str(ipaddress.ip_network(cidr))
+        except ValueError:
+            raise s.error(key, f"{cidr!r} is not an IPv4 or IPv6 network") from None
+        if network not in networks:
+            networks.append(network)
+    return tuple(networks)
 
 
 def _overflow(s: Section | None, profiles: tuple[Profile, ...]) -> OverflowConfig | None:

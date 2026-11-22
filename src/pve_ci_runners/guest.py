@@ -96,9 +96,13 @@ class Guest:
         }
         self._runner.guest(vmid, with_inputs("prepare", inputs))
 
-    def isolated(self, vmid: int, host_addresses: tuple[str, ...]) -> bool:
-        """Whether a probe from inside the VM fails to reach the hypervisor on any of its addresses."""
-        inputs = {"GATEWAY": str(self._network.gateway), "HOST_ADDRESSES": " ".join(host_addresses)}
+    def isolated(self, vmid: int, host_addresses: tuple[str, ...], deny_sample: tuple[str, ...]) -> bool:
+        """Whether a probe from inside the VM reaches neither the hypervisor nor a sample of denied hosts."""
+        inputs = {
+            "GATEWAY": str(self._network.gateway),
+            "HOST_ADDRESSES": " ".join(host_addresses),
+            "DENY_SAMPLE": " ".join(deny_sample),
+        }
         try:
             self._runner.guest(vmid, with_inputs("probe", inputs), timeout=30)
         except GuestError as err:

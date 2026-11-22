@@ -60,8 +60,10 @@ class Hypervisor(Protocol):
         """Removes a VM."""
         ...
 
-    def attach(self, vmid: int, disk: str, device: str, serial: str) -> None:
-        """Hot-plugs a block device."""
+    def attach(
+        self, vmid: int, disk: str, device: str, serial: str, *, limits: Sequence[tuple[str, int]]
+    ) -> None:
+        """Hot-plugs a block device with IO limits."""
         ...
 
     def detach(self, vmid: int, disk: str) -> None:
@@ -70,6 +72,10 @@ class Hypervisor(Protocol):
 
     def host_addresses(self) -> tuple[str, ...]:
         """The node's own global addresses."""
+        ...
+
+    def host_networks(self) -> tuple[str, ...]:
+        """The node's own addresses and the networks they sit on, as CIDRs."""
         ...
 
     def agent_ready(self, vmid: int) -> bool:

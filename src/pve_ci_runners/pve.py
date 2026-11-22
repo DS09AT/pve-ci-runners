@@ -3,7 +3,7 @@
 import ipaddress
 import json
 import socket
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -193,14 +193,15 @@ class Pve:
         """Stops and removes a VM with its disks and firewall file."""
         self._commands.run(["qm", "stop", str(vmid), "--skiplock", "1"], timeout=180)
         output(self._commands, ["qm", "destroy", str(vmid), "--purge", "1"], timeout=300)
+        # The VMID is free cluster-wide now, so no other guest's rules can sit in this file.
+        (self._firewall_dir / f"{vmid}.fw").unlink(missing_ok=True)
 
-    def attach(self, vmid: int, disk: str, device: str, serial: str) -> None:
-        """Hot-plugs a host block device; the guest finds it by its serial."""
-        output(
-            self._commands,
-            ["qm", "set", str(vmid), f"--{disk}", f"{device},serial={serial},discard=on"],
-            timeout=120,
-        )
+    def attach(
+        self, vmid: int, disk: str, device: str, serial: str, *, limits: Sequence[tuple[str, int]]
+    ) -> None:
+        """Hot-plugs a host block device with IO limits; the guest finds it by its serial."""
+        value = ",".join([device, f"serial={serial}", "discard=on", *(f"{k}={v}" for k, v in limits)])
+        output(self._commands, ["qm", "set", str(vmid), f"--{disk}", value], timeout=120)
 
     def detach(self, vmid: int, disk: str) -> None:
         """Removes a hot-plugged disk without touching the device behind it."""
@@ -209,14 +210,26 @@ class Pve:
     def host_addresses(self) -> tuple[str, ...]:
         """Every global, non-loopback address of this node; an empty list is an error, never "none"."""
         found: list[str] = []
-        for link in _dicts(self._json(["ip", "-j", "addr"])):
-            for info in _dicts(link.get("addr_info")):
-                address = _global_address(info)
-                if address is not None and address not in found:
-                    found.append(address)
+        for info in self._address_infos():
+            address = _global_address(info)
+            if address is not None and address not in found:
+                found.append(address)
         if not found:
             raise CommandError("ip addr listed no global address of this node")
         return tuple(found)
+
+    def host_networks(self) -> tuple[str, ...]:
+        """Every address of this node as a single-address network, followed by the network it is on.
+
+        Loopback and IPv6 link-local addresses are left out: a guest on the bridge reaches neither.
+        """
+        interfaces = [i for info in self._address_infos() if (i := _interface(info)) is not None]
+        found = tuple(
+            dict.fromkeys(str(n) for i in interfaces for n in (ipaddress.ip_network(i.ip), i.network))
+        )
+        if not found:
+            raise CommandError("ip addr listed no address of this node")
+        return found
 
     def agent_ready(self, vmid: int) -> bool:
         """Whether the guest agent answers."""
@@ -242,6 +255,13 @@ class Pve:
             raise GuestError(f"VM {vmid}: {err}") from None
         return _guest_output(_guest_result(raw, vmid), vmid, timeout)
 
+    def _address_infos(self) -> list[dict[str, object]]:
+        return [
+            info
+            for link in _dicts(self._json(["ip", "-j", "addr"]))
+            for info in _dicts(link.get("addr_info"))
+        ]
+
     def _json(self, argv: list[str]) -> object:
         try:
             return json.loads(output(self._commands, argv, timeout=60))
@@ -257,6 +277,18 @@ def _global_address(info: dict[str, object]) -> str | None:
     except ValueError:
         raise CommandError("ip addr listed an invalid address") from None
     return None if address.is_loopback else str(address)
+
+
+def _interface(info: dict[str, object]) -> ipaddress.IPv4Interface | ipaddress.IPv6Interface | None:
+    try:
+        interface = ipaddress.ip_interface(f"{info.get('local', '')}/{info.get('prefixlen', '')}")
+    except ValueError:
+        raise CommandError("ip addr listed an invalid address") from None
+    if interface.ip.is_loopback or (
+        isinstance(interface, ipaddress.IPv6Interface) and interface.ip.is_link_local
+    ):
+        return None
+    return interface
 
 
 def _guest_output(result: dict[str, object], vmid: int, timeout: int) -> str:
@@ -311,9 +343,13 @@ def _tags(item: Mapping[str, object]) -> frozenset[str]:
     return frozenset(t for t in str(item.get("tags", "")).split(";") if t)
 
 
+def is_ours(vmid: object, name: object, tags: Collection[str], names: Mapping[int, str]) -> bool:
+    """Whether a guest is the VM pve-ci-runners creates at its VMID: `names` maps the VMID to that name."""
+    return isinstance(vmid, int) and vmid in names and name == names[vmid] and TAG in tags
+
+
 def _ours(vm: Mapping[str, object], names: Mapping[int, str]) -> bool:
-    vmid = vm.get("vmid")
-    return isinstance(vmid, int) and vmid in names and vm.get("name") == names[vmid] and TAG in _tags(vm)
+    return is_ours(vm.get("vmid"), vm.get("name"), _tags(vm), names)
 
 
 def _int(value: object) -> int:

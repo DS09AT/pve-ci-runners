@@ -70,6 +70,10 @@ class CacheBackend(Protocol):
         """Finishes interrupted write-backs, removes orphans and expired caches; returns log lines."""
         ...
 
+    def purge(self) -> None:
+        """Removes every cache and job copy this backend created."""
+        ...
+
 
 class NoCache:
     """For hosts without a supported store: every job starts empty."""
@@ -92,3 +96,6 @@ class NoCache:
     def maintain(self, in_use: set[str]) -> list[str]:  # noqa: ARG002, PLR6301 - interface method
         """Nothing to maintain."""
         return []
+
+    def purge(self) -> None:
+        """Nothing to remove."""

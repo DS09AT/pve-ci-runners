@@ -21,6 +21,7 @@ from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.proc import HostCommands
 from pve_ci_runners.pve import Pve
 from pve_ci_runners.status import collect
+from pve_ci_runners.teardown import Teardown
 from pve_ci_runners.template_build import TemplateBuilder
 
 _ATTACH_INTERVAL = 2.0
@@ -68,6 +69,11 @@ def _parser() -> argparse.ArgumentParser:
         "drain", help="take no new jobs and release idle VMs; running jobs finish"
     ).set_defaults(handler=_drain)
     commands.add_parser("resume", help="take new jobs again").set_defaults(handler=_resume)
+    teardown = commands.add_parser(
+        "teardown", help="drain, wait for running jobs, remove every VM and registration of this node"
+    )
+    teardown.add_argument("--purge-cache", action="store_true", help="also destroy every job cache")
+    teardown.set_defaults(handler=_teardown)
     commands.add_parser("version", help="print the version").set_defaults(handler=_version)
     return parser
 
@@ -97,6 +103,21 @@ def _resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _teardown(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
+    loaded = configuration.load(args.config)
+    commands = HostCommands()
+    actions = Actions(_client(loaded, commands), allowed=loaded.github.repositories)
+    teardown = Teardown(loaded, Pve(commands), actions, _cache(loaded, commands))
+    failures = teardown.run(purge_cache=args.purge_cache)
+    for failure in failures:
+        print(f"pve-ci-runners: {failure}", file=sys.stderr)
+    if failures:
+        return 1
+    print("torn down: no VM, registration or file of pve-ci-runners is left; the node stays drained")
+    return 0
+
+
 def _doctor(args: argparse.Namespace) -> int:
     loaded = configuration.load(args.config)
     commands = HostCommands()
@@ -123,9 +144,8 @@ def _run(args: argparse.Namespace) -> int:
     configuration.check_secret_file(loaded.github.app_key_file)
     commands = HostCommands()
     actions = Actions(_client(loaded, commands), allowed=loaded.github.repositories)
-    cache: CacheBackend = ZfsCache(loaded.cache, commands) if loaded.cache.backend == "zfs" else NoCache()
     overflow = Overflow(loaded.overflow, actions) if loaded.overflow else None
-    controller = Controller(loaded, Pve(commands), actions, cache, overflow=overflow)
+    controller = Controller(loaded, Pve(commands), actions, _cache(loaded, commands), overflow=overflow)
     log.info(
         "controller %s up: %d slots, profiles %s",
         VERSION,
@@ -138,6 +158,10 @@ def _run(args: argparse.Namespace) -> int:
         while time.monotonic() < deadline:
             _attach(controller)
             time.sleep(_ATTACH_INTERVAL)
+
+
+def _cache(loaded: configuration.Config, commands: HostCommands) -> CacheBackend:
+    return ZfsCache(loaded.cache, commands) if loaded.cache.backend == "zfs" else NoCache()
 
 
 def _client(loaded: configuration.Config, commands: HostCommands) -> GitHubClient:
