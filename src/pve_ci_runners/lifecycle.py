@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Collection, Mapping
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from pathlib import Path
 
 from pve_ci_runners.cache import CacheBackend, cache_key
@@ -46,6 +47,10 @@ class Lifecycle:
         self._cache = cache
         self._guest = Guest(hypervisor, config.network, config.cache)
         self._clock = clock
+        # Tidying a cache can take minutes. In the background one VM's tidy holds up neither the other VMs
+        # nor queued jobs, and one worker per slot lets every finished VM tidy at the same time.
+        self._executor: Executor = ThreadPoolExecutor(len(config.slots), thread_name_prefix="tidy")
+        self._tidying: dict[int, tuple[VmState, Future[None]]] = {}
 
     def name(self, vmid: int) -> str:
         """The VM name of a slot."""
@@ -145,8 +150,35 @@ class Lifecycle:
     def finish(self, vmid: int, state: VmState, repositories: Mapping[str, str]) -> bool:
         """Retires a VM whose runner exited; writes its cache back only after a trusted success.
 
-        `repositories` maps the served repositories to their default branches.
+        `repositories` maps the served repositories to their default branches. False while GitHub has not
+        recorded the result or the guest still tidies the cache; the next cycle asks again.
         """
+        write_back = self._write_back(vmid, state, repositories)
+        if write_back is None:
+            return False
+        self._remove(vmid, state, repositories, write_back=write_back)
+        return True
+
+    def _write_back(self, vmid: int, state: VmState, repositories: Mapping[str, str]) -> bool | None:
+        """Whether the cache is written back, or None while that is not known yet.
+
+        A tidy counts only for the state it was started for, so a description rewritten in the meantime is
+        decided again from GitHub.
+        """
+        tidying = self._tidying.get(vmid)
+        if tidying is None or tidying[0] != state:
+            keep = self._keep(vmid, state, repositories)
+            if not keep:
+                return keep
+            tidying = self._tidying[vmid] = (state, self._executor.submit(self._guest.tidy, vmid))
+            log.info("VM %s: tidying its cache for the write-back", vmid)
+        if not tidying[1].done():
+            return None
+        del self._tidying[vmid]
+        return self._tidied(vmid, tidying[1])
+
+    def _keep(self, vmid: int, state: VmState, repositories: Mapping[str, str]) -> bool | None:
+        """Whether the run may and should keep its cache, or None while GitHub has not recorded the result."""
         default_branch = repositories.get(state.repository or "")
         conclusion = None
         if state.verified is not None and state.cache is not None and state.repository and state.runner:
@@ -155,16 +187,15 @@ class Lifecycle:
             if conclusion is None and (state.done_at is None or now - state.done_at < _RESULT_GRACE):
                 if state.done_at is None:
                     self._save(vmid, state.evolve(done_at=now))
-                return False
+                return None
         if conclusion != "success":
             self._keep_logs(vmid, state)
-        keep = self._should_keep(vmid, state, conclusion, default_branch) and self._tidied(vmid)
-        self._remove(vmid, state, repositories, write_back=keep)
-        return True
+        return self._should_keep(vmid, state, conclusion, default_branch)
 
-    def _tidied(self, vmid: int) -> bool:
+    @staticmethod
+    def _tidied(vmid: int, tidying: Future[None]) -> bool:
         try:
-            self._guest.tidy(vmid)
+            tidying.result()
         except PveCiError as err:
             log.warning("VM %s: cache not tidied, not written back: %s", vmid, err)
             return False

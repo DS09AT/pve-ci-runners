@@ -2,7 +2,9 @@
 
 import fcntl
 import json
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from pve_ci_runners.actions import QueuedJob, Registration
@@ -333,3 +335,26 @@ def holds_memory_lock(state_dir: Path) -> bool:
             return True
         fcntl.flock(handle, fcntl.LOCK_UN)
         return False
+
+
+class Background(Executor):
+    """Holds submitted work until `run`, so a test decides when it ends; `inline` runs it at once."""
+
+    def __init__(self, *, inline: bool = False) -> None:
+        self.inline = inline
+        self.pending: list[tuple[Future, partial]] = []
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        future: Future = Future()
+        self.pending.append((future, partial(fn, *args, **kwargs)))
+        if self.inline:
+            self.run()
+        return future
+
+    def run(self) -> None:
+        while self.pending:
+            future, work = self.pending.pop(0)
+            try:
+                future.set_result(work())
+            except Exception as err:  # noqa: BLE001 - the future carries any failure to its reader
+                future.set_exception(err)
