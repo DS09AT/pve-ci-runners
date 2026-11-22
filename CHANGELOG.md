@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.3.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.2...v0.3.0) (2026-11-22)
+
+
+### Features
+
+* deny the host's own networks to runners and add teardown ([ca9cf67](https://github.com/DS09AT/pve-ci-runners/commit/ca9cf672af8e2bce94134dc297fd03f30adad6de))
+
 ## [0.2.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.1...v0.2.2) (2026-11-22)
 
 
