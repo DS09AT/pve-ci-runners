@@ -262,6 +262,27 @@ def test_vm_operations_call_qm_with_fixed_arguments(tmp_path: Path) -> None:
     assert (tmp_path / "122.fw").exists()
 
 
+def test_destroying_a_vm_another_process_removed_first_succeeds_but_other_failures_do_not(
+    tmp_path: Path,
+) -> None:
+    missing = done("", 2, "Configuration file 'nodes/pve1/qemu-server/121.conf' does not exist")
+
+    def pve(cluster: object) -> Pve:
+        script = Script({("qm", "destroy"): missing, ("pvesh", "get", "/cluster/resources"): done(cluster)})
+        return Pve(script, node="pve1", firewall_dir=tmp_path)
+
+    (tmp_path / "121.fw").write_text("[OPTIONS]\n", encoding="utf-8")
+    pve([{"vmid": 122, "type": "qemu"}]).destroy(121)
+    assert not (tmp_path / "121.fw").exists(), "the gone VM's leftover firewall file is removed"
+
+    (tmp_path / "121.fw").write_text("[OPTIONS]\n", encoding="utf-8")
+    with pytest.raises(CommandError, match="qm destroy exited 2"):
+        pve([{"vmid": 121, "type": "qemu"}]).destroy(121)
+    with pytest.raises(CommandError, match="no list"):
+        pve({"not": "a list"}).destroy(121)
+    assert (tmp_path / "121.fw").exists(), "a VMID still in use keeps its firewall file"
+
+
 def test_template_build_operations_call_qm_and_pvesm_with_fixed_arguments() -> None:
     script = Script({
         ("pvesm", "path", "local:snippets/a.yaml"): done("/var/lib/vz/snippets/a.yaml\n"),

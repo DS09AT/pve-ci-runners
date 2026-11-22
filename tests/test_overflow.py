@@ -2,8 +2,9 @@ import pytest
 
 from pve_ci_runners.config import parse
 from pve_ci_runners.errors import GitHubError
-from pve_ci_runners.overflow import Hysteresis, Overflow, decide
+from pve_ci_runners.overflow import REASSERT_SECONDS, Hysteresis, Overflow, decide
 from tests.conftest import config_data
+from tests.fakes import FakeGitHub
 
 
 @pytest.fixture
@@ -61,3 +62,27 @@ def test_forced_overflow_and_failed_writes_are_reported(overflow_config) -> None
 
     assert overflow.on
     assert any("not updated" in line for line in lines)
+
+
+def test_an_unchanged_value_is_written_again_only_after_the_reassert_interval(overflow_config) -> None:
+    writer = Writer()
+    overflow = Overflow(overflow_config, writer)
+
+    overflow.update(unserved=0, oldest_wait=0, now=1000)
+    assert overflow.update(unserved=0, oldest_wait=0, now=1000 + REASSERT_SECONDS - 1) == []
+    lines = overflow.update(unserved=0, oldest_wait=0, now=1000 + REASSERT_SECONDS)
+
+    assert len(writer.writes) == 2 and writer.writes[0] == writer.writes[1]
+    assert lines == ['example-org/app: CI_RUNS_ON = ["self-hosted","pve-ci"]']
+
+
+def test_a_value_overwritten_elsewhere_is_corrected_within_one_interval(overflow_config) -> None:
+    github = FakeGitHub()
+    overflow = Overflow(overflow_config, github)
+    key = ("example-org/app", "CI_RUNS_ON")
+    overflow.update(unserved=5, oldest_wait=0, now=1000)
+    github.variables[key] = '["self-hosted","pve-ci"]'
+
+    overflow.update(unserved=5, oldest_wait=0, now=1000 + REASSERT_SECONDS)
+
+    assert github.variables[key] == '"ubuntu-latest"'
