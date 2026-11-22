@@ -17,6 +17,8 @@ mkdir -p /cache
 mount -o discard "$disk" /cache
 while read -r directory path owner; do
   [ -n "$directory" ] || continue
+  # A missing parent such as ~/.cache would otherwise be created root-owned and lock the owner out of it.
+  [ -d "$(dirname "$path")" ] || install -d -o "$owner" -g "$owner" "$(dirname "$path")"
   install -d -o "$owner" -g "$owner" "/cache/$directory" "$path"
   mount --bind "/cache/$directory" "$path"
 done <<<"$MOUNTS"

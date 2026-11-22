@@ -8,7 +8,7 @@ find /cache/nuget/packages -mindepth 2 -maxdepth 2 -type d -atime "+$UNUSED_DAYS
 docker builder prune -f --keep-storage "${DOCKER_KEEP_GB}GB" >/dev/null 2>&1
 docker image prune -a -f --filter "until=$((UNUSED_DAYS * 24))h" >/dev/null 2>&1
 if [ "$(du -sm /cache | cut -f1)" -gt "$WIPE_ABOVE_MB" ]; then
-  rm -rf /cache/nuget/* /cache/npm/*
+  rm -rf /cache/nuget/* /cache/npm/* /cache/uv/*
 fi
 systemctl stop ci-runner docker.socket docker.service containerd.service 2>/dev/null
 while read -r path; do
