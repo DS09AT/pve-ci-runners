@@ -14,7 +14,7 @@ useradd --create-home --shell /bin/bash runner
 # Hosted runners give jobs passwordless sudo; workflows rely on it. The VM is discarded after one job.
 echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 chmod 0440 /etc/sudoers.d/runner
-install -d -o runner -g runner /home/runner/.nuget /home/runner/.npm /opt/hostedtoolcache /opt/actions-runner
+install -d -o runner -g runner /home/runner/.nuget /home/runner/.npm /home/runner/.cache /opt/hostedtoolcache /opt/actions-runner
 
 # GitHub publishes a SHA-256 digest for every release asset; the download must match it.
 release=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest)

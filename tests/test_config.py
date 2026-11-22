@@ -362,3 +362,14 @@ def test_the_template_needs_an_address_of_its_own() -> None:
 
     with pytest.raises(ConfigError, match=r"template\.address: is a slot's address"):
         parse(data)
+
+
+def test_the_uv_cache_is_cached_where_the_runner_points_uv() -> None:
+    uv = next(m for m in DEFAULT_MOUNTS if m.directory == "uv")
+    prepare = (Path(__file__).parent.parent / "src/pve_ci_runners/guest/prepare.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"Environment=UV_CACHE_DIR={uv.path}\n" in prepare, (
+        "setup-uv would fall back to a per-job temp dir"
+    )

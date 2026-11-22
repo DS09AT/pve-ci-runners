@@ -53,6 +53,8 @@ Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/pve-ci-runners/job-started.sh
 # The toolchains the template installed sit where the setup-* actions look first.
 Environment=RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 Environment=DOTNET_INSTALL_DIR=/opt/hostedtoolcache/dotnet DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1
+# setup-uv keeps a UV_CACHE_DIR that is already set, so uv uses the cached directory, not a temp dir.
+Environment=UV_CACHE_DIR=/home/runner/.cache/uv
 Environment=LANG=C.UTF-8
 LimitNOFILE=65536
 ExecStart=/opt/pve-ci-runners/start-runner.sh

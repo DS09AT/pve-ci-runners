@@ -394,6 +394,7 @@ def _cache(s: Section | None) -> CacheConfig:
 DEFAULT_MOUNTS = (
     CacheMount(PurePosixPath("/home/runner/.nuget"), "nuget", "runner"),
     CacheMount(PurePosixPath("/home/runner/.npm"), "npm", "runner"),
+    CacheMount(PurePosixPath("/home/runner/.cache/uv"), "uv", "runner"),
     CacheMount(PurePosixPath("/var/lib/docker"), "docker", "root"),
     CacheMount(PurePosixPath("/var/lib/containerd"), "containerd", "root"),
 )
