@@ -12,11 +12,12 @@ from pve_ci_runners.config import Config, parse
 from pve_ci_runners.controller import Controller, profile_for
 from pve_ci_runners.drain import drain, reserve
 from pve_ci_runners.errors import CommandError, GitHubError, GuestError
+from pve_ci_runners.lifecycle import Lifecycle
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.pve import TAG
 from pve_ci_runners.state import VerifiedJob, decode
 from tests.conftest import config_data
-from tests.fakes import HEAD, FakeCache, FakeGitHub, FakeHost, FakeVm, holds_memory_lock
+from tests.fakes import HEAD, Background, FakeCache, FakeGitHub, FakeHost, FakeVm, holds_memory_lock
 
 KEY = cache_key("example-org/app", "ci.yml", "build")
 
@@ -45,7 +46,9 @@ def controller(
     config: Config, host: FakeHost, github: FakeGitHub, cache: FakeCache, clock: Clock
 ) -> Controller:
     assert config.overflow is not None
-    return Controller(config, host, github, cache, overflow=Overflow(config.overflow, github), clock=clock)
+    ctl = Controller(config, host, github, cache, overflow=Overflow(config.overflow, github), clock=clock)
+    ctl._lifecycle._executor = Background(inline=True)
+    return ctl
 
 
 def state(host: FakeHost, vmid: int):
@@ -923,3 +926,75 @@ def test_a_cache_the_guest_cannot_tidy_is_not_written_back(setup, monkeypatch) -
 
     assert 121 not in host.machines
     assert cache.written == [] and cache.dropped == [KEY]
+
+
+def test_a_long_cache_tidy_holds_up_neither_queued_jobs_nor_the_freed_slot(setup, monkeypatch) -> None:
+    config, host, github, cache, clock = setup
+    poll = config.daemon.poll_seconds
+    ctl = started_job(setup)
+    ctl.cycle()
+    assert state(host, 122).phase == "warm"
+    background = Background()
+    ctl._lifecycle._executor = background
+
+    def slow_tidy(_vmid: int) -> None:
+        clock.now += 150
+
+    monkeypatch.setattr(ctl._lifecycle._guest, "tidy", slow_tidy)
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+    github.queue("example-org/app", count=3)
+    queued_at = clock.now
+
+    ctl.cycle()
+    assert state(host, 122).phase == "assigned"
+    assert state(host, 122).since - queued_at <= poll, "the warm VM takes a job while VM 121 tidies"
+    assert 121 in host.machines and cache.written == []
+
+    background.run()
+    clock.now += poll
+    ctl.cycle()
+    assert cache.written == [KEY], "the tidied cache of the trusted run is written back"
+    assert 121 not in host.machines
+    freed_at = clock.now
+
+    for _ in range(2):
+        clock.now += poll
+        ctl.cycle()
+    assert state(host, 121).phase == "assigned"
+    assert state(host, 121).since - freed_at <= 2 * poll
+
+
+def test_a_tidy_started_for_one_state_never_writes_back_another(setup) -> None:
+    _, host, github, cache, _ = setup
+    ctl = started_job(setup)
+    background = Background()
+    ctl._lifecycle._executor = background
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+    ctl.cycle()
+    assert len(background.pending) == 1
+
+    background.run()
+    tidied = state(host, 121)
+    assert tidied is not None and tidied.cache is not None
+    forged = replace(tidied, cache=replace(tidied.cache, key="example-org/forged"))
+    host.machines[121].description = forged.encode()
+    ctl.cycle()
+
+    assert 121 not in host.machines
+    assert cache.written == [] and cache.dropped == ["example-org/forged"], "GitHub is asked again"
+
+
+def test_the_tidy_runs_on_a_thread_of_its_own(setup) -> None:
+    config, host, github, cache, clock = setup
+    ctl = started_job(setup)
+    ctl._lifecycle = Lifecycle(config, host, github, cache, clock=clock)
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+
+    ctl.cycle()
+    ctl._lifecycle._executor.shutdown(wait=True)
+    ctl.cycle()
+
+    assert 121 not in host.machines and cache.written == [KEY]
