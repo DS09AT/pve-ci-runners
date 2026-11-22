@@ -138,6 +138,29 @@ def test_doctor_prints_every_finding_and_fails_on_a_failed_check(
     }
 
 
+def test_teardown_passes_the_purge_flag_and_fails_on_any_failure(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+    failures: list[str] = []
+
+    class FakeTeardown:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def run(self, *, purge_cache: bool) -> list[str]:
+            calls.append(purge_cache)
+            return list(failures)
+
+    monkeypatch.setattr(cli, "Teardown", FakeTeardown)
+    assert cli.main(["-c", str(config_file), "teardown"]) == 0
+    assert "torn down" in capsys.readouterr().out
+    failures.append("VM 121: qm destroy 121 failed")
+    assert cli.main(["-c", str(config_file), "teardown", "--purge-cache"]) == 1
+    assert capsys.readouterr().err == "pve-ci-runners: VM 121: qm destroy 121 failed\n"
+    assert calls == [False, True]
+
+
 def with_app_key(config_file: Path, mode: int) -> None:
     key = config_file.parent / "app.pem"
     key.write_text("key", encoding="utf-8")

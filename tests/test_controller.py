@@ -356,6 +356,52 @@ def test_disk_limits_are_applied_to_the_root_disk(setup) -> None:
     assert host.machines[121].disks["scsi0"].endswith(",mbps_wr=200")
 
 
+def test_disk_limits_also_apply_to_the_cache_disk(setup) -> None:
+    config, host, github, cache, clock = setup
+    profile = replace(config.profiles[0], disk_limits=(("iops_wr", 500), ("mbps_wr", 200)))
+    limited = replace(config, profiles=(profile,))
+    ctl = controller(limited, host, github, cache, clock)
+    ctl.cycle()
+    ctl.cycle()
+    github.queue("example-org/app")
+    ctl.cycle()
+    host.machines[121].run_id = 42
+    github.runs[42] = VerifiedJob(
+        42, "build", ".github/workflows/ci.yml", "main", "push", same_repository=True, head_sha=HEAD
+    )
+
+    ctl.attach_pending()
+
+    assert host.machines[121].disks["scsi1"].endswith("serial=cicache,iops_wr=500,mbps_wr=200")
+
+
+def test_the_nic_rate_limits_every_runner_vm(setup) -> None:
+    config, host, github, cache, clock = setup
+    limited = replace(config, network=replace(config.network, rate=50))
+
+    controller(limited, host, github, cache, clock).cycle()
+
+    assert host.machines[121].options["net0"] == "virtio,bridge=vmbr1,firewall=1,rate=50"
+
+
+def test_the_firewall_denies_the_hosts_networks_and_the_probe_tries_a_sample_of_them(setup) -> None:
+    config, host, github, cache, clock = setup
+    denied = replace(config, firewall=replace(config.firewall, deny_destinations=("198.51.100.0/24",)))
+    ctl = controller(denied, host, github, cache, clock)
+    host.networks = ()
+    ctl.cycle()
+    assert 121 not in host.machines, "without the host's networks no VM is cloned"
+
+    host.networks = FakeHost().networks
+    ctl.cycle()
+    ctl.cycle()
+
+    ipset = host.firewall[121].split("[IPSET deny]\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert ipset == ["198.51.100.0/24", *host.networks]
+    assert state(host, 121).phase == "warm"
+    assert "DENY_SAMPLE='198.51.100.1 203.0.113.1'" in host.probes[-1]
+
+
 def test_jobs_pick_their_profile_by_the_match_label(config: Config) -> None:
     assert profile_for(frozenset({"self-hosted", "pve-ci"}), config.profiles) is config.profiles[0]
     assert profile_for(frozenset({"self-hosted", "PVE-CI", "linux"}), config.profiles) is config.profiles[0]

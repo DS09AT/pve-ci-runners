@@ -120,6 +120,7 @@ bridge = "vmbr1"         # a NAT bridge that only runner VMs use
 gateway = "192.168.100.1"
 prefix = 24
 dns = ["192.0.2.53"]
+# rate = 50              # NIC limit of every runner and build VM in MB/s; default: none
 
 [[slot]]
 vmid = 121
@@ -138,6 +139,7 @@ memory_mb = 5120
 warm = 1                               # VMs kept booted and isolated, ready for the next job
 max = 2
 qm_options = { cpuunits = 100 }        # lower CPU priority than the host's other guests
+# disk_limits = { mbps_wr = 200, iops_wr = 2000 }   # IO limits of the root and the cache disk
 
 [cache]
 backend = "zfs"                        # or "none"
@@ -154,6 +156,10 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # versions = { node = "22.23.5", go = "1.27.4", python = "3.12.16", dotnet = "9.0" }
 # scripts = ["/etc/pve-ci-runners/provision.d/extra.sh"]   # run as root in the template, root-owned
 
+# [firewall]                           # private, link-local, multicast and IPv6 egress is always denied
+# deny_destinations = ["198.51.100.0/24", "2001:db8::/32"]  # denied too, like this host's own networks
+# extra_rules = ["OUT DROP -dest 203.0.113.0/24 # example"]  # after the denials, so they cannot reopen one
+
 # [overflow]                           # send jobs to a hosted runner while every slot is busy
 # variable = "CI_RUNS_ON"
 # self_value = '["self-hosted", "pve-ci"]'
@@ -169,6 +175,18 @@ running or not, because a stopped VM may boot at any moment and runner VMs give 
 `pve-ci-runners doctor` fails its `guest memory` check when the physical memory cannot hold those guests,
 the reserve and `capacity.memory_mb` together.
 
+Every runner and build VM's firewall drops egress to the private, shared, link-local, multicast and IPv6
+ranges, and to an IP set `deny` holding `firewall.deny_destinations` (IPv4 or IPv6 networks) plus every
+address of the Proxmox node and the network each address sits on, as `ip -j addr` lists them when the
+VM's firewall file is written; loopback and IPv6 link-local addresses are left out. These denials come
+first, so neither `firewall.extra_rules` nor `firewall.ssh_destinations` can reopen a denied destination;
+`extra_rules` can still drop more or allow public destinations ahead of the SSH and mail rules. Before a VM
+takes a job, its isolation probe also tries one address in each of up to eight denied IPv4 networks.
+The DNS servers in `network.dns` must lie outside every denied network, or the VMs cannot resolve names.
+
+`network.rate` limits the NIC of every runner and build VM, in MB/s. A profile's `disk_limits`
+(`mbps_rd`, `mbps_wr`, `iops_rd`, `iops_wr`) apply to the root disk and to the hot-plugged cache disk.
+
 ## Commands
 
 | Command | What it does |
@@ -179,7 +197,26 @@ the reserve and `capacity.memory_mb` together.
 | `pve-ci-runners template build` | builds the next runner template; the weekly timer runs it |
 | `pve-ci-runners status [--json]` | what every slot does, read from the host |
 | `pve-ci-runners drain` / `resume` | stop and resume taking new jobs; idle VMs are released, running jobs finish |
+| `pve-ci-runners teardown [--purge-cache]` | removes every VM, template and runner registration of this node; see below |
 | `pve-ci-runners version` | prints the version |
+
+### Teardown
+
+`pve-ci-runners teardown` drains the node, waits until no job runs (a job that outlived
+`daemon.max_job_seconds` counts as done, as it does for the controller), then removes every VM at a
+configured slot or template VMID that carries the `pve-ci-runners` tag and exactly the name the controller
+gives a VM there, with its disks, firewall file and runner registration, plus leftover template build
+snippets and the build's memory reservation. Any other guest, including one that took a configured VMID,
+is left alone. Job caches are kept unless `--purge-cache` is given, which destroys the `jobs` and `repos`
+datasets below `cache.dataset` but not `cache.dataset` itself. It fails while a template build runs,
+exits non-zero if any step failed, and can be repeated until it succeeds. The node stays drained;
+`resume` takes jobs again. To decommission a node, stop the timer and the service first, so no controller
+cycle races the removal, then run `teardown`:
+
+```sh
+systemctl disable --now pve-ci-runners-template.timer pve-ci-runners.service
+pve-ci-runners teardown --purge-cache
+```
 
 ## Security model
 

@@ -202,6 +202,31 @@ def test_firewall_destinations_and_extra_rules_are_validated() -> None:
     assert parse(data).firewall.extra_rules == ("OUT ACCEPT -dest 10.0.0.5 -p tcp -dport 443 # registry",)
 
 
+def test_deny_destinations_are_ipv4_or_ipv6_networks_in_normal_form_each_once() -> None:
+    assert parse(config_data()).firewall.deny_destinations == ()
+    data = config_data(
+        firewall={"deny_destinations": ["198.51.100.0/24", "2001:DB8::/32", "2001:db8::/32", "192.0.2.7"]}
+    )
+    assert parse(data).firewall.deny_destinations == ("198.51.100.0/24", "2001:db8::/32", "192.0.2.7/32")
+
+    for bad in ("198.51.100.1/24", "not-a-network", "2001:db8::/129"):
+        with pytest.raises(ConfigError, match="not an IPv4 or IPv6 network"):
+            parse(config_data(firewall={"deny_destinations": [bad]}))
+    with pytest.raises(ConfigError, match=r"lists '198\.51\.100\.0/24' twice"):
+        parse(config_data(firewall={"deny_destinations": ["198.51.100.0/24", "198.51.100.0/24"]}))
+
+
+def test_the_nic_rate_is_optional_and_positive() -> None:
+    network = dict(config_data()["network"])
+    assert parse(config_data(network=network)).network.nic == "virtio,bridge=vmbr1,firewall=1"
+    assert parse(config_data(network={**network, "rate": 50, "vlan": 7})).network.nic == (
+        "virtio,bridge=vmbr1,firewall=1,tag=7,rate=50"
+    )
+    for bad in (0, -1, 1.5, "50"):
+        with pytest.raises(ConfigError, match=r"network\.rate"):
+            parse(config_data(network={**network, "rate": bad}))
+
+
 def test_template_needs_exactly_two_distinct_vmids() -> None:
     for vmids in ([9201], [9201, 9201], [9201, "9202"]):
         data = config_data(template={"vmids": vmids, "storage": "local-zfs"})

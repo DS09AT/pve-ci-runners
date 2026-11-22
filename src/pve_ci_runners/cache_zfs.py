@@ -106,6 +106,15 @@ class ZfsCache:
         lines += self._expire()
         return lines
 
+    def purge(self) -> None:
+        """Destroys every job clone, then every cache; the configured dataset itself is the operator's.
+
+        Clones depend on snapshots of the caches, so the clones go first.
+        """
+        for dataset in (self.jobs, self.repos):
+            if succeeds(self._commands, ["zfs", "list", "-H", "-o", "name", dataset]):
+                self._zfs("destroy", "-r", dataset)
+
     def _owned(self, lease: CacheLease, vmid: int) -> bool:
         return self._identity(lease, vmid) is not None
 

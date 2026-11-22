@@ -9,7 +9,7 @@ from pve_ci_runners.cache import MAX_KEY_LENGTH, NoCache, cache_key
 from pve_ci_runners.capacity import HostMemory, vms_that_fit
 from pve_ci_runners.config import Config
 from pve_ci_runners.errors import GuestError
-from pve_ci_runners.firewall import render
+from pve_ci_runners.firewall import deny_set, probe_sample, render
 from pve_ci_runners.guest import parse_run_id, payload_version, script, with_inputs
 from pve_ci_runners.promotion import may_write_back, worth_keeping
 from pve_ci_runners.state import CacheLease, VerifiedJob
@@ -34,33 +34,75 @@ def test_both_units_start_only_after_the_onboot_guests(unit: str) -> None:
     assert not any("pve-guests" in line for line in lines if line.startswith(("Wants=", "Requires=")))
 
 
+HOST_NETWORKS = ("203.0.113.10/32", "203.0.113.0/26", "2001:db8::10/128", "2001:db8::/64")
+DENIED = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "::/0", "+deny")
+
+
 def test_the_firewall_denies_inbound_private_and_ipv6_and_pins_the_address(config: Config) -> None:
-    text = render(config.slots[0], config.firewall)
+    text = render(config.slots[0], config.firewall, HOST_NETWORKS)
 
     assert "policy_in: DROP" in text
     assert "[IPSET ipfilter-net0]\n192.168.100.21\n" in text
-    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::/0"):
-        assert f"OUT DROP -dest {cidr}" in text
+    for cidr in DENIED:
+        assert f"OUT DROP -dest {cidr} " in text
     assert text.index("-dport 22 # git over SSH") < text.index("OUT DROP -p tcp -dport 22")
 
 
-def test_no_ssh_destination_reopens_a_private_one(config: Config) -> None:
+def test_the_deny_ipset_holds_the_configured_destinations_and_the_hosts_networks_once(config: Config) -> None:
     from dataclasses import replace
 
-    text = render(config.slots[0], replace(config.firewall, ssh_destinations=("0.0.0.0/0",)))
+    firewall = replace(config.firewall, deny_destinations=("198.51.100.0/24", "203.0.113.0/26"))
+    text = render(config.slots[0], firewall, HOST_NETWORKS)
+
+    entries = text.split("[IPSET deny]\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert entries == [
+        "198.51.100.0/24",
+        "203.0.113.0/26",
+        "203.0.113.10/32",
+        "2001:db8::10/128",
+        "2001:db8::/64",
+    ]
+    assert deny_set(firewall, HOST_NETWORKS) == tuple(entries)
+
+
+def test_no_ssh_destination_reopens_a_denied_one(config: Config) -> None:
+    from dataclasses import replace
+
+    text = render(config.slots[0], replace(config.firewall, ssh_destinations=("0.0.0.0/0",)), HOST_NETWORKS)
 
     ssh = text.index("OUT ACCEPT -dest 0.0.0.0/0 -p tcp -dport 22")
-    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "::/0"):
+    for cidr in DENIED:
         assert text.index(f"OUT DROP -dest {cidr} ") < ssh
 
 
-def test_extra_rules_come_before_the_denials(config: Config) -> None:
+def test_no_extra_rule_reopens_a_denied_destination(config: Config) -> None:
     from dataclasses import replace
 
-    firewall = replace(config.firewall, extra_rules=("OUT ACCEPT -dest 10.0.0.5 -p tcp -dport 443",))
-    text = render(config.slots[0], firewall)
+    firewall = replace(
+        config.firewall,
+        deny_destinations=("198.51.100.0/24",),
+        extra_rules=("OUT ACCEPT -dest 198.51.100.7,10.0.0.5,203.0.113.10 -p tcp -dport 443",),
+    )
+    text = render(config.slots[0], firewall, HOST_NETWORKS)
 
-    assert text.index("OUT ACCEPT -dest 10.0.0.5") < text.index("OUT DROP -dest 10.0.0.0/8")
+    extra = text.index("OUT ACCEPT -dest 198.51.100.7")
+    for cidr in DENIED:
+        assert text.index(f"OUT DROP -dest {cidr} ") < extra
+    assert extra < text.index("OUT DROP -p tcp -dport 22")
+
+
+def test_the_probe_sample_takes_one_new_ipv4_address_per_denied_network() -> None:
+    denied = (
+        "198.51.100.0/24",
+        "192.0.2.7/32",
+        "203.0.113.10/32",
+        "203.0.113.0/31",
+        "2001:db8::/64",
+        "198.51.100.0/25",
+    )
+    assert probe_sample(denied, ("203.0.113.10",)) == ("198.51.100.1", "192.0.2.7", "203.0.113.0")
+    many = tuple(f"198.51.100.{i}/32" for i in range(20))
+    assert probe_sample(many, ()) == tuple(f"198.51.100.{i}" for i in range(8))
 
 
 def test_cache_keys_stay_inside_their_repository() -> None:
@@ -178,7 +220,14 @@ def test_an_oversized_or_deeply_nested_report_is_a_guest_error(report: str) -> N
         parse_run_id(report)
 
 
-def test_the_probe_tries_every_host_address_not_only_the_gateway() -> None:
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"HOST_ADDRESSES": "198.51.100.7 127.0.0.1", "DENY_SAMPLE": ""},
+        {"HOST_ADDRESSES": "198.51.100.7", "DENY_SAMPLE": "192.0.2.9 127.0.0.1"},
+    ],
+)
+def test_the_probe_tries_every_host_address_and_the_deny_sample(inputs: dict[str, str]) -> None:
     import socket
 
     listener = socket.socket()
@@ -192,7 +241,7 @@ def test_the_probe_tries_every_host_address_not_only_the_gateway() -> None:
         pytest.skip("neither probe port is free on this host")
     listener.listen()
     try:
-        probe = with_inputs("probe", {"GATEWAY": "192.0.2.1", "HOST_ADDRESSES": "198.51.100.7 127.0.0.1"})
+        probe = with_inputs("probe", {"GATEWAY": "192.0.2.1", **inputs})
         done = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, timeout=30, check=False)
     finally:
         listener.close()

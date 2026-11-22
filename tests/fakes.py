@@ -54,6 +54,12 @@ class FakeHost:
         self.snippet_dir = Path("/nonexistent")
         self.probes: list[str] = []
         self.addresses: tuple[str, ...] = ("192.168.100.1", "203.0.113.10")
+        self.networks: tuple[str, ...] = (
+            "192.168.100.1/32",
+            "192.168.100.0/24",
+            "203.0.113.10/32",
+            "203.0.113.0/24",
+        )
         self.datacenter_firewall = True
         self.uncreatable: set[int] = set()
         self.protected: set[int] = set()
@@ -118,8 +124,10 @@ class FakeHost:
         self.firewall.pop(vmid, None)
         self.events.append(f"destroy {vmid}")
 
-    def attach(self, vmid: int, disk: str, device: str, serial: str) -> None:
-        self.machines[vmid].disks[disk] = f"{device},serial={serial}"
+    def attach(self, vmid: int, disk: str, device: str, serial: str, *, limits) -> None:
+        self.machines[vmid].disks[disk] = f"{device},serial={serial}" + "".join(
+            f",{k}={v}" for k, v in limits
+        )
 
     def detach(self, vmid: int, disk: str) -> None:
         self.machines[vmid].disks.pop(disk, None)
@@ -128,6 +136,11 @@ class FakeHost:
         if not self.addresses:
             raise CommandError("ip addr listed no global address of this node")
         return self.addresses
+
+    def host_networks(self) -> tuple[str, ...]:
+        if not self.networks:
+            raise CommandError("ip addr listed no address of this node")
+        return self.networks
 
     def agent_ready(self, vmid: int) -> bool:
         return self.machines[vmid].agent
@@ -255,6 +268,7 @@ class FakeCache:
         self.dropped: list[str] = []
         self.bytes = 10 * 2**20
         self.leased_for: dict[str, tuple[str, int]] = {}
+        self.purged = False
 
     def lease(self, key: str, vmid: int, *, runner: str, run_id: int) -> Attachment:
         lease = CacheLease(
@@ -278,6 +292,9 @@ class FakeCache:
 
     def maintain(self, in_use: set[str]) -> list[str]:
         return []
+
+    def purge(self) -> None:
+        self.purged = True
 
 
 class Script:

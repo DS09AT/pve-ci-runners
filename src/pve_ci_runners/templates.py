@@ -65,6 +65,11 @@ def build_vm_name(name_prefix: str, vmid: int) -> str:
     return f"{name_prefix}template-{vmid}"
 
 
+def build_snippet(storage: str, vmid: int) -> str:
+    """The cloud-init snippet volume a template build at `vmid` writes and removes again."""
+    return f"{storage}:snippets/pve-ci-runners-build-{vmid}.yaml"
+
+
 def reserved_build_vms(config: Config) -> dict[int, str]:
     """The build VM's name per template VMID while a build holds its memory reservation, otherwise none.
 

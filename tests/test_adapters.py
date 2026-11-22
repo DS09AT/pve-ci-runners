@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from pve_ci_runners.cache import NoCache
 from pve_ci_runners.cache_zfs import KEY_PROPERTY, PROMOTING_PROPERTY, RUN_PROPERTY, RUNNER_PROPERTY, ZfsCache
 from pve_ci_runners.config import Config
 from pve_ci_runners.drain import drain, draining, reserve, reserved_mb, resume
@@ -80,6 +81,41 @@ def test_host_addresses_are_the_global_non_loopback_ones_and_none_is_an_error() 
     bad = [{"addr_info": [{"local": "203.0.113.10; reboot", "scope": "global"}]}]
     with pytest.raises(CommandError, match="invalid address"):
         Pve(Script({("ip", "-j", "addr"): done(bad)}), node="pve1").host_addresses()
+
+
+def test_host_networks_are_every_address_and_its_network_without_loopback_or_ipv6_link_local() -> None:
+    links = [
+        {
+            "ifname": "lo",
+            "addr_info": [{"local": "127.0.0.1", "prefixlen": 8}, {"local": "::1", "prefixlen": 128}],
+        },
+        {
+            "ifname": "vmbr0",
+            "addr_info": [
+                {"local": "203.0.113.10", "prefixlen": 26},
+                {"local": "203.0.113.11", "prefixlen": 26},
+                {"local": "2001:db8::10", "prefixlen": 64},
+                {"local": "fe80::1", "prefixlen": 64},
+            ],
+        },
+        {"ifname": "wg0", "addr_info": [{"local": "10.10.1.1", "prefixlen": 24}]},
+    ]
+    pve = Pve(Script({("ip", "-j", "addr"): done(links)}), node="pve1")
+    assert pve.host_networks() == (
+        "203.0.113.10/32",
+        "203.0.113.0/26",
+        "203.0.113.11/32",
+        "2001:db8::10/128",
+        "2001:db8::/64",
+        "10.10.1.1/32",
+        "10.10.1.0/24",
+    )
+
+    with pytest.raises(CommandError, match="no address"):
+        Pve(Script({("ip", "-j", "addr"): done(links[:1])}), node="pve1").host_networks()
+    for bad in ({"local": "203.0.113.10; reboot", "prefixlen": 24}, {"local": "203.0.113.10"}):
+        with pytest.raises(CommandError, match="invalid address"):
+            Pve(Script({("ip", "-j", "addr"): done([{"addr_info": [bad]}])}), node="pve1").host_networks()
 
 
 def test_guest_exec_passes_stdin_and_the_script_as_separate_arguments() -> None:
@@ -199,20 +235,31 @@ def test_vm_operations_call_qm_with_fixed_arguments(tmp_path: Path) -> None:
     script = Script({("qm", "agent"): done("", 2)})
     (tmp_path / "121.pid").write_text("4242\n", encoding="utf-8")
     (tmp_path / "4242").mkdir()
-    pve = Pve(script, node="pve1", run_dir=tmp_path, proc_dir=tmp_path)
+    pve = Pve(script, node="pve1", firewall_dir=tmp_path, run_dir=tmp_path, proc_dir=tmp_path)
+    (tmp_path / "121.fw").write_text("[OPTIONS]\n", encoding="utf-8")
+    (tmp_path / "122.fw").write_text("[OPTIONS]\n", encoding="utf-8")
     pve.clone(9201, 121, "ci-runner-121")
     pve.start(121)
-    pve.attach(121, "scsi1", "/dev/zvol/rpool/x", "cicache")
+    pve.attach(121, "scsi1", "/dev/zvol/rpool/x", "cicache", limits=[("mbps_wr", 200), ("iops_rd", 500)])
     pve.detach(121, "scsi1")
     pve.set_description(121, "{}")
+    pve.destroy(121)
     pve.destroy(121)
     assert not pve.agent_ready(121)
     assert script.calls[:4] == [
         ["qm", "clone", "9201", "121", "--name", "ci-runner-121", "--full", "0"],
         ["qm", "start", "121"],
-        ["qm", "set", "121", "--scsi1", "/dev/zvol/rpool/x,serial=cicache,discard=on"],
+        [
+            "qm",
+            "set",
+            "121",
+            "--scsi1",
+            "/dev/zvol/rpool/x,serial=cicache,discard=on,mbps_wr=200,iops_rd=500",
+        ],
         ["qm", "set", "121", "--delete", "scsi1"],
     ]
+    assert not (tmp_path / "121.fw").exists(), "a destroyed VM leaves no firewall file behind"
+    assert (tmp_path / "122.fw").exists()
 
 
 def test_template_build_operations_call_qm_and_pvesm_with_fixed_arguments() -> None:
@@ -516,6 +563,25 @@ def test_a_device_that_never_appears_is_an_error(config: Config) -> None:
     )
     with pytest.raises(CommandError, match="did not appear"):
         cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=42)
+
+
+def test_a_purge_destroys_the_clones_then_the_caches_and_skips_what_is_gone(config: Config) -> None:
+    script = Script({("zfs", "list", "-H", "-o", "name", "rpool/ci-cache/jobs"): done("", 1)})
+
+    zfs_cache(config, script).purge()
+
+    assert [" ".join(c) for c in script.calls] == [
+        "zfs list -H -o name rpool/ci-cache/jobs",
+        "zfs list -H -o name rpool/ci-cache/repos",
+        "zfs destroy -r rpool/ci-cache/repos",
+    ]
+    script = Script()
+    zfs_cache(config, script).purge()
+    assert [" ".join(c) for c in script.calls if c[1] == "destroy"] == [
+        "zfs destroy -r rpool/ci-cache/jobs",
+        "zfs destroy -r rpool/ci-cache/repos",
+    ]
+    NoCache().purge()
 
 
 def test_drain_flag_round_trip(tmp_path: Path) -> None:

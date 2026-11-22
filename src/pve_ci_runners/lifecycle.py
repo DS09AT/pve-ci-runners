@@ -10,7 +10,7 @@ from pathlib import Path
 from pve_ci_runners.cache import CacheBackend, cache_key
 from pve_ci_runners.config import Config, Profile, Slot
 from pve_ci_runners.errors import PveCiError
-from pve_ci_runners.firewall import render
+from pve_ci_runners.firewall import deny_set, probe_sample, render
 from pve_ci_runners.guest import CACHE_SERIAL, Guest, payload_version
 from pve_ci_runners.ports import GitHubActions, Hypervisor
 from pve_ci_runners.promotion import may_write_back, worth_keeping
@@ -58,9 +58,10 @@ class Lifecycle:
 
     def create(self, slot: Slot, profile: Profile, template: int) -> None:
         """Clones the template, locks the VM down and boots it."""
+        rules = render(slot, self._config.firewall, self._pve.host_networks())
         self._pve.clone(template, slot.vmid, self.name(slot.vmid))
         # The clone inherited the template's firewall file; the slot's own rules replace it before boot.
-        self._pve.write_firewall(slot.vmid, render(slot, self._config.firewall))
+        self._pve.write_firewall(slot.vmid, rules)
         state = VmState(
             phase="booting", since=int(self._clock()), profile=profile.name, payload=payload_version()
         )
@@ -75,7 +76,9 @@ class Lifecycle:
         if not self._pve.agent_ready(slot.vmid):
             return None
         self._guest.prepare(slot.vmid, slot, self.name(slot.vmid))
-        if not self._guest.isolated(slot.vmid, self._pve.host_addresses()):
+        addresses = self._pve.host_addresses()
+        sample = probe_sample(deny_set(self._config.firewall, self._pve.host_networks()), addresses)
+        if not self._guest.isolated(slot.vmid, addresses, sample):
             try:
                 self._pve.destroy(slot.vmid)
             except PveCiError:
@@ -133,7 +136,8 @@ class Lifecycle:
             self._guest.release(vmid)
             return state
         state = self._save(vmid, state.evolve(cache=attachment.lease))
-        self._pve.attach(vmid, CACHE_DISK, attachment.device, CACHE_SERIAL)
+        limits = self._config.profile(state.profile).disk_limits
+        self._pve.attach(vmid, CACHE_DISK, attachment.device, CACHE_SERIAL, limits=limits)
         self._guest.attach(vmid)
         log.info("VM %s got the cache %s", vmid, attachment.lease.key)
         return state

@@ -20,13 +20,13 @@ from pve_ci_runners.capacity import vms_that_fit
 from pve_ci_runners.config import Config, Slot
 from pve_ci_runners.drain import drain, draining, memory_lock, release, reserve, resume
 from pve_ci_runners.errors import PveCiError
-from pve_ci_runners.firewall import render
+from pve_ci_runners.firewall import deny_set, probe_sample, render
 from pve_ci_runners.guest import Guest, script, with_inputs
 from pve_ci_runners.images import fetch_image
 from pve_ci_runners.lifecycle import IsolationError
 from pve_ci_runners.ports import TemplateHypervisor
 from pve_ci_runners.pve import TAG
-from pve_ci_runners.templates import TemplateMarker, build_vm_name, current_template
+from pve_ci_runners.templates import TemplateMarker, build_snippet, build_vm_name, current_template
 
 _PROVISION = "provision"
 _VERSIONED = frozenset({"node", "dotnet", "go", "python"})
@@ -63,7 +63,7 @@ class TemplateBuilder:
     def build(self) -> tuple[int, str]:
         """Builds a template; returns its VMID and the runner version it carries."""
         state_dir = self._config.daemon.state_dir
-        with _exclusive(state_dir / "template.lock"):
+        with template_lock(state_dir):
             if not self._host.firewall_enabled():
                 raise PveCiError("the datacenter firewall is off, so the build VM would not be isolated")
             template = self._config.template
@@ -138,7 +138,7 @@ class TemplateBuilder:
         return build_vm_name(self._config.daemon.name_prefix, vmid)
 
     def _snippet(self, vmid: int) -> str:
-        return f"{self._config.template.snippet_storage}:snippets/pve-ci-runners-build-{vmid}.yaml"
+        return build_snippet(self._config.template.snippet_storage, vmid)
 
     def _target(self) -> int:
         """The VMID of the pair that is not the current template, freed of an earlier build."""
@@ -187,10 +187,11 @@ class TemplateBuilder:
 
     def _boot(self, vmid: int) -> None:
         """Locks the build VM down, boots it and proves its isolation before any provisioning step runs."""
-        template = self._config.template
+        template, firewall = self._config.template, self._config.firewall
+        networks = self._host.host_networks()
         # qm create refuses a VMID in use anywhere in the cluster, so the firewall file written after it
         # cannot replace another VM's rules; the VM still boots only once the file exists.
-        self._host.write_firewall(vmid, render(Slot(vmid, template.address), self._config.firewall))
+        self._host.write_firewall(vmid, render(Slot(vmid, template.address), firewall, networks))
         self._host.resize(vmid, "scsi0", f"{template.disk_gb}G")
         # Checked again: runner VMs may have started while the image was imported.
         with memory_lock(self._config.daemon.state_dir):
@@ -203,7 +204,8 @@ class TemplateBuilder:
                 raise PveCiError(f"the build VM {vmid} did not start its guest agent in time")
             self._sleep(_POLL)
         guest = Guest(self._host, self._config.network, self._config.cache)
-        if not guest.isolated(vmid, self._host.host_addresses()):
+        addresses = self._host.host_addresses()
+        if not guest.isolated(vmid, addresses, probe_sample(deny_set(firewall, networks), addresses)):
             raise IsolationError(
                 f"the build VM {vmid} reached the hypervisor; check the datacenter and VM firewall"
             )
@@ -268,7 +270,9 @@ def _private(info: os.stat_result, kind: Callable[[int], bool]) -> bool:
 
 
 @contextmanager
-def _exclusive(lock: Path) -> Generator[None]:
+def template_lock(state_dir: Path) -> Generator[None]:
+    """Held by a template build, and by a teardown so that no build creates a VM while it removes them."""
+    lock = state_dir / "template.lock"
     lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with lock.open("w", encoding="utf-8") as handle:
         try:
