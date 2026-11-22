@@ -305,17 +305,26 @@ def _guest_output(result: dict[str, object], vmid: int, timeout: int) -> str:
     return str(result.get("out-data", ""))
 
 
+CLUSTER_FIREWALL = "/etc/pve/firewall/cluster.fw"
+
+
 def datacenter_firewall_enabled(commands: Commands) -> bool:
-    """Whether the datacenter firewall is on; without it no VM firewall rule takes effect."""
-    try:
-        options = json.loads(
-            output(
-                commands, ["pvesh", "get", "/cluster/firewall/options", "--output-format", "json"], timeout=60
-            )
-        )
-    except ValueError:
-        raise CommandError("pvesh get /cluster/firewall/options returned no JSON") from None
-    return isinstance(options, dict) and cast("dict[str, object]", options).get("enable") == 1
+    """Whether the datacenter firewall is on; without it no VM firewall rule takes effect.
+
+    The option is read from cluster.fw itself, the file the API reads too, because some
+    pve-firewall releases fail to compile the /cluster/firewall/options API method.
+    """
+    text = output(commands, ["cat", CLUSTER_FIREWALL], timeout=30)
+    section = ""
+    values: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+        elif section == "[OPTIONS]" and stripped.partition(":")[0].strip() == "enable":
+            values.append(stripped.partition(":")[2].strip())
+    # A hand-edited file may repeat the key; only a file whose every value is on counts as on.
+    return bool(values) and all(value == "1" for value in values)
 
 
 def _guest_result(raw: str, vmid: int) -> dict[str, object]:

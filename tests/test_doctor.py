@@ -10,7 +10,7 @@ from tests.conftest import config_data
 from tests.fakes import FakeHost, FakeVm, Script, done
 
 HEALTHY = {
-    ("pvesh", "get", "/cluster/firewall/options"): done({"enable": 1}),
+    ("cat", "/etc/pve/firewall/cluster.fw"): done("[OPTIONS]\npolicy_in: DROP\nenable: 1\n"),
     ("ip", "-j", "addr", "show", "dev", "vmbr1"): done([
         {"addr_info": [{"local": "192.168.100.1", "prefixlen": 24}]}
     ]),
@@ -78,7 +78,7 @@ def test_a_ready_node_passes_every_check(config: Config) -> None:
 @pytest.mark.parametrize(
     ("command", "answer", "check"),
     [
-        (("pvesh", "get", "/cluster/firewall/options"), done({"enable": 0}), "datacenter firewall"),
+        (("cat", "/etc/pve/firewall/cluster.fw"), done("[OPTIONS]\nenable: 0\n"), "datacenter firewall"),
         (("ip", "-j", "addr", "show", "dev", "vmbr1"), done([]), "bridge"),
         (("sysctl", "-n", "net.ipv4.ip_forward"), done("0\n"), "forwarding"),
         (("pvesh", "get", "/storage/local"), done({"type": "dir", "content": "iso"}), "snippet storage"),
@@ -94,7 +94,7 @@ def test_a_ready_node_passes_every_check(config: Config) -> None:
             "backup jobs",
         ),
         (("pvesh", "get", "/cluster/backup"), done([{"id": "vms", "vmid": "100,122"}]), "backup jobs"),
-        (("pvesh", "get", "/cluster/firewall/options"), done("not json"), "datacenter firewall"),
+        (("cat", "/etc/pve/firewall/cluster.fw"), done("", 1), "datacenter firewall"),
         (("pvesh", "get", "/storage/local"), done("not json"), "snippet storage"),
         (("pvesh", "get", "/storage/local-zfs"), done(["not", "an", "object"]), "template storage"),
     ],
