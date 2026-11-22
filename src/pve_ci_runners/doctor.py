@@ -15,7 +15,7 @@ from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.ports import GitHubApp, Hypervisor
 from pve_ci_runners.proc import Commands, output, succeeds
 from pve_ci_runners.pve import TAG, datacenter_firewall_enabled
-from pve_ci_runners.templates import current_template
+from pve_ci_runners.templates import build_vm_name, current_template, reserved_build_vms
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,6 +70,7 @@ class Doctor:
             ("forwarding", self._forwarding),
             ("outbound NAT", self._nat),
             ("memory reserve", self._reserve),
+            ("guest memory", self._guest_memory),
             ("template storage", self._template_storage),
             ("snippet storage", self._snippet_storage),
             ("cache dataset", self._dataset),
@@ -159,6 +160,25 @@ class Doctor:
             f"raise capacity.host_reserve_mb to at least {needed}, or lower zfs_arc_max",
         )
 
+    def _guest_memory(self) -> Finding:
+        capacity = self._config.capacity
+        # Slot VMs are covered by capacity.memory_mb; a build VM only while its reservation exists.
+        host = self._pve.host_memory(self._slot_names() | reserved_build_vms(self._config))
+        needed = capacity.memory_mb + capacity.host_reserve_mb + host.committed_mb
+        numbers = (
+            f"capacity.memory_mb {capacity.memory_mb} + capacity.host_reserve_mb {capacity.host_reserve_mb} "
+            f"+ {host.committed_mb} MiB configured for the other guests, running or not"
+        )
+        if host.total_mb >= needed:
+            return Finding("ok", "guest memory", f"{host.total_mb} MiB cover {numbers}")
+        return Finding(
+            "fail",
+            "guest memory",
+            f"{host.total_mb} MiB do not cover {numbers} = {needed} MiB; the runners never get their budget",
+            f"lower capacity.memory_mb or capacity.host_reserve_mb by {needed - host.total_mb} MiB in total, "
+            "or remove or shrink stopped guests",
+        )
+
     def _template_storage(self) -> Finding:
         storage = self._config.template.storage
         info = self._storage(storage)
@@ -203,8 +223,7 @@ class Doctor:
 
     def _vmids(self) -> Finding:
         prefix = self._config.daemon.name_prefix
-        expected = {s.vmid: f"{prefix}{s.vmid}" for s in self._config.slots}
-        expected |= {v: f"{prefix}template-{v}" for v in self._config.template.vmids}
+        expected = self._slot_names() | {v: build_vm_name(prefix, v) for v in self._config.template.vmids}
         vms = self._pve.vms()
         foreign = sorted(
             vmid
@@ -220,6 +239,9 @@ class Doctor:
             f"{listed} hold VMs that pve-ci-runners did not create; they are left alone and stay unusable",
             "move those VMs or configure other VMIDs",
         )
+
+    def _slot_names(self) -> dict[int, str]:
+        return {s.vmid: f"{self._config.daemon.name_prefix}{s.vmid}" for s in self._config.slots}
 
     def _backups(self) -> Finding:
         ours = {s.vmid for s in self._config.slots} | set(self._config.template.vmids)

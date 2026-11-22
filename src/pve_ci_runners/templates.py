@@ -9,6 +9,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
+from pve_ci_runners.config import Config
+from pve_ci_runners.drain import reserved_mb
 from pve_ci_runners.pve import VmInfo
 
 MARKER_KIND = "pve-ci-runners-template"
@@ -56,3 +58,19 @@ def current_template(
         if (marker := decode_marker(description(vmid))) is not None
     ]
     return max(found, key=lambda item: item[1].built_at) if found else None
+
+
+def build_vm_name(name_prefix: str, vmid: int) -> str:
+    """The name a template build gives its VM at `vmid`; the sealed template keeps it."""
+    return f"{name_prefix}template-{vmid}"
+
+
+def reserved_build_vms(config: Config) -> dict[int, str]:
+    """The build VM's name per template VMID while a build holds its memory reservation, otherwise none.
+
+    Only the reservation accounts for a build VM's memory; one left behind after a build counts like any
+    other guest.
+    """
+    if reserved_mb(config.daemon.state_dir) <= 0:
+        return {}
+    return {vmid: build_vm_name(config.daemon.name_prefix, vmid) for vmid in config.template.vmids}

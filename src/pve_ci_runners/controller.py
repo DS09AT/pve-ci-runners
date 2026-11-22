@@ -24,7 +24,7 @@ from pve_ci_runners.ports import GitHubActions, Hypervisor
 from pve_ci_runners.pve import TAG, VmInfo
 from pve_ci_runners.scheduler import Demand, Plan, ProfileLimits, Round, plan_all
 from pve_ci_runners.state import VmState, decode
-from pve_ci_runners.templates import current_template
+from pve_ci_runners.templates import current_template, reserved_build_vms
 
 _REPOSITORY_REFRESH = 600
 _MAINTENANCE_INTERVAL = 3600
@@ -254,7 +254,7 @@ class Controller:
         free = [v for v in self._slots if v not in infos]
         # Without a template nothing can start, so the jobs count as unserved and overflow can take them.
         startable = bool(free) and not held and self._template(infos) is not None
-        host = self._pve.host_memory() if startable else None
+        host = self._pve.host_memory(reserved_build_vms(self._config)) if startable else None
         budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
         inputs = []
         for profile in self._config.profiles:
@@ -301,7 +301,7 @@ class Controller:
 
     def _create(self, creations: list[tuple[str, int]], template: int, infos: dict[int, VmInfo]) -> None:
         with memory_lock(self._config.daemon.state_dir):
-            host = self._pve.host_memory()
+            host = self._pve.host_memory(reserved_build_vms(self._config))
             budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
             committed = host.committed_mb
             for name, vmid in creations:

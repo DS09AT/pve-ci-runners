@@ -1,6 +1,7 @@
 import re
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,15 @@ def test_the_host_reserve_and_the_budget_both_bound_new_vms() -> None:
     assert vms_that_fit(host, reserve_mb=40000, budget_left_mb=20480, vm_mb=5120) == 0
     with pytest.raises(ValueError, match="positive"):
         vms_that_fit(host, reserve_mb=0, budget_left_mb=1, vm_mb=0)
+
+
+@pytest.mark.parametrize("unit", ["pve-ci-runners.service", "pve-ci-runners-template.service"])
+def test_both_units_start_only_after_the_onboot_guests(unit: str) -> None:
+    lines = Path("packaging", unit).read_text(encoding="utf-8").splitlines()
+    after = [word for line in lines if line.startswith("After=") for word in line[6:].split()]
+
+    assert "pve-guests.service" in after
+    assert not any("pve-guests" in line for line in lines if line.startswith(("Wants=", "Requires=")))
 
 
 def test_the_firewall_denies_inbound_private_and_ipv6_and_pins_the_address(config: Config) -> None:

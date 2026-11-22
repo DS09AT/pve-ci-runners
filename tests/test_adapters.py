@@ -122,7 +122,7 @@ def test_node_listing_memory_and_options(tmp_path: Path) -> None:
     vms = pve.vms()
     assert set(vms) == {101, 9201}
     assert vms[101].running and vms[101].tags == frozenset({"prod"}) and vms[9201].template
-    memory = pve.host_memory()
+    memory = pve.host_memory({})
     assert (memory.total_mb, memory.committed_mb) == (65536, 10240)
 
     pve.limit_disk(121, "scsi0", [("mbps_wr", 200), ("iops_rd", 500)])
@@ -139,10 +139,58 @@ def test_node_listing_memory_and_options(tmp_path: Path) -> None:
     assert script.calls[-1] == ["qm", "set", "121", "--cores", "4", "--description", "--delete scsi0"]
 
 
+def test_host_memory_counts_stopped_guests_and_slot_vms_but_not_templates_or_build_vms() -> None:
+    gib = 2**30
+    build = {"vmid": 9202, "name": "ci-runner-template-9202", "tags": "pve-ci-runners", "maxmem": 5 * gib}
+    pve = Pve(
+        Script({
+            ("pvesh", "get", "/nodes/pve1/qemu"): done([
+                {"vmid": 101, "status": "stopped", "maxmem": 16 * gib},
+                {"vmid": 121, "status": "stopped", "maxmem": 4 * gib},
+                {"vmid": 9201, "status": "stopped", "maxmem": 3 * gib, "template": 1},
+                {**build, "status": "running"},
+            ]),
+            ("pvesh", "get", "/nodes/pve1/lxc"): done([
+                {"vmid": 200, "status": "stopped", "maxmem": 2 * gib}
+            ]),
+            ("pvesh", "get", "/nodes/pve1/status"): done({"memory": {"total": 64 * gib}}),
+        }),
+        node="pve1",
+    )
+
+    build_vms = {9201: "ci-runner-template-9201", 9202: "ci-runner-template-9202"}
+    assert pve.host_memory(build_vms).committed_mb == (16 + 4 + 2) * 1024
+    assert pve.host_memory({}).committed_mb == (16 + 4 + 2 + 5) * 1024
+
+
+@pytest.mark.parametrize(
+    ("kind", "guest"),
+    [
+        ("qemu", {"name": "ci-runner-template-9202"}),
+        ("qemu", {"name": "ci-runner-template-9202", "tags": "prod"}),
+        ("qemu", {"name": "windows", "tags": "pve-ci-runners"}),
+        ("lxc", {"name": "ci-runner-template-9202", "tags": "pve-ci-runners"}),
+    ],
+)
+def test_a_foreign_guest_or_a_container_on_a_build_vmid_is_counted(kind: str, guest: dict[str, str]) -> None:
+    gib = 2**30
+    listing = [{"vmid": 9202, "status": "stopped", "maxmem": 5 * gib, **guest}]
+    pve = Pve(
+        Script({
+            ("pvesh", "get", "/nodes/pve1/qemu"): done(listing if kind == "qemu" else []),
+            ("pvesh", "get", "/nodes/pve1/lxc"): done(listing if kind == "lxc" else []),
+            ("pvesh", "get", "/nodes/pve1/status"): done({"memory": {"total": 64 * gib}}),
+        }),
+        node="pve1",
+    )
+
+    assert pve.host_memory({9202: "ci-runner-template-9202"}).committed_mb == 5 * 1024
+
+
 def test_node_status_without_memory_is_an_error() -> None:
     pve = Pve(Script({("pvesh", "get", "/nodes/pve1/status"): done({})}), node="pve1")
     with pytest.raises(CommandError, match="memory total"):
-        pve.host_memory()
+        pve.host_memory({})
     with pytest.raises(CommandError, match="no JSON"):
         Pve(Script({("pvesh",): done("<html>")}), node="pve1").vms()
 

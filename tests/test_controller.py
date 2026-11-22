@@ -241,6 +241,54 @@ def test_the_host_reserve_keeps_runner_vms_out(setup) -> None:
     assert set(host.machines) == {9201}
 
 
+@pytest.mark.parametrize("running", [False, True])
+def test_a_production_guest_keeps_runner_vms_out_even_while_it_is_stopped(setup, running: bool) -> None:
+    config, _, github, cache, clock = setup
+    host = FakeHost(total_mb=32000, other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[100] = FakeVm(name="windows", running=running, memory_mb=26000)
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {100, 9201}
+
+
+def test_a_build_vm_left_without_a_reservation_keeps_runner_vms_out(setup) -> None:
+    config, _, github, cache, clock = setup
+    host = FakeHost(total_mb=32000, other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[9202] = FakeVm(name="ci-runner-template-9202", running=True, memory_mb=26000, tags={TAG})
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201, 9202}
+
+
+def test_a_build_vm_counts_once_while_its_reservation_holds_its_memory(setup) -> None:
+    config, _, github, cache, clock = setup
+    host = FakeHost(total_mb=32000, other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[9202] = FakeVm(name="ci-runner-template-9202", running=True, memory_mb=16000, tags={TAG})
+    reserve(config.daemon.state_dir, 16000)
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert 121 in host.machines
+
+
+@pytest.mark.parametrize(("name", "tags"), [("ci-runner-template-9202", set()), ("windows", {TAG})])
+def test_a_foreign_vm_on_a_template_vmid_counts_even_during_a_build(setup, name: str, tags: set[str]) -> None:
+    config, _, github, cache, clock = setup
+    host = FakeHost(total_mb=32000, other_guests_mb=0)
+    host.add_template(9201)
+    host.machines[9202] = FakeVm(name=name, memory_mb=26000, tags=tags)
+    reserve(config.daemon.state_dir, 1)
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert set(host.machines) == {9201, 9202}
+
+
 def test_draining_takes_no_new_jobs_and_sends_them_to_the_hosted_runner(setup) -> None:
     config, host, github, cache, clock = setup
     drain(config.daemon.state_dir)
@@ -723,8 +771,8 @@ def test_a_runner_that_waited_the_idle_timeout_for_a_job_is_retired(setup) -> No
 def test_no_vm_starts_when_the_host_filled_up_since_planning(setup, monkeypatch, caplog) -> None:
     caplog.set_level(logging.INFO)
     config, host, github, cache, clock = setup
-    answers = iter([host.host_memory(), HostMemory(host.total_mb, host.total_mb)])
-    monkeypatch.setattr(host, "host_memory", lambda: next(answers))
+    answers = iter([host.host_memory({}), HostMemory(host.total_mb, host.total_mb)])
+    monkeypatch.setattr(host, "host_memory", lambda _excluded: next(answers))
 
     controller(config, host, github, cache, clock).cycle()
 

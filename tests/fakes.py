@@ -11,7 +11,7 @@ from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.errors import CommandError, GitHubError, GuestError
 from pve_ci_runners.guest import script
 from pve_ci_runners.proc import Completed
-from pve_ci_runners.pve import VmInfo
+from pve_ci_runners.pve import TAG, VmInfo
 from pve_ci_runners.state import CacheLease, VerifiedJob
 from pve_ci_runners.templates import TemplateMarker
 
@@ -72,9 +72,13 @@ class FakeHost:
     def config(self, vmid: int) -> dict[str, object]:
         return {"description": self.machines[vmid].description, **self.machines[vmid].disks}
 
-    def host_memory(self) -> HostMemory:
-        runners = sum(v.memory_mb for v in self.machines.values() if v.running)
-        return HostMemory(self.total_mb, self.other_guests_mb + runners)
+    def host_memory(self, excluded) -> HostMemory:
+        guests = sum(
+            vm.memory_mb
+            for vmid, vm in self.machines.items()
+            if not vm.template and not (excluded.get(vmid) == vm.name and TAG in vm.tags)
+        )
+        return HostMemory(self.total_mb, self.other_guests_mb + guests)
 
     def set_description(self, vmid: int, text: str) -> None:
         self.machines[vmid].description = text

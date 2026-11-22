@@ -3,7 +3,7 @@
 import ipaddress
 import json
 import socket
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -61,7 +61,7 @@ class Pve:
                     running=item.get("status") == "running",
                     memory_mb=_int(item.get("maxmem")) // _MB,
                     template=item.get("template") in {1, "1"},
-                    tags=frozenset(t for t in str(item.get("tags", "")).split(";") if t),
+                    tags=_tags(item),
                 )
         return result
 
@@ -78,18 +78,23 @@ class Pve:
             raise CommandError(f"VM {vmid} returned no configuration")
         return cast("dict[str, object]", value)
 
-    def host_memory(self) -> HostMemory:
-        """Physical memory and what the running guests of every kind are promised."""
+    def host_memory(self, excluded: Mapping[int, str]) -> HostMemory:
+        """Physical memory and what every guest of every kind is configured with, running or not.
+
+        A stopped guest counts because it may boot at any moment, for example during `pve-guests.service`
+        after a reboot, and runner VMs must give way to it. Templates never run. `excluded` maps a VMID to
+        the name of the VM pve-ci-runners creates there, whose memory is accounted for elsewhere; only a
+        VM with that name and our tag is left out, so a foreign VM or a container on that VMID still counts.
+        """
         status = self._json(["pvesh", "get", f"/nodes/{self.node}/status", "--output-format", "json"])
         memory = _dicts([cast("dict[str, object]", status).get("memory")]) if isinstance(status, dict) else []
         total = _int(memory[0].get("total")) if memory else 0
         if total <= 0:
             raise CommandError("the node status reports no memory total")
-        guests = [
-            *_dicts(self._json(["pvesh", "get", f"/nodes/{self.node}/qemu", "--output-format", "json"])),
-            *_dicts(self._json(["pvesh", "get", f"/nodes/{self.node}/lxc", "--output-format", "json"])),
-        ]
-        committed = sum(_int(g.get("maxmem")) for g in guests if g.get("status") == "running")
+        qemu = _dicts(self._json(["pvesh", "get", f"/nodes/{self.node}/qemu", "--output-format", "json"]))
+        lxc = _dicts(self._json(["pvesh", "get", f"/nodes/{self.node}/lxc", "--output-format", "json"]))
+        guests = [*(vm for vm in qemu if not _ours(vm, excluded)), *lxc]
+        committed = sum(_int(g.get("maxmem")) for g in guests if g.get("template") not in {1, "1"})
         return HostMemory(total_mb=total // _MB, committed_mb=committed // _MB)
 
     def set_description(self, vmid: int, text: str) -> None:
@@ -300,6 +305,15 @@ def _dicts(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     return [cast("dict[str, object]", v) for v in cast("list[object]", value) if isinstance(v, dict)]
+
+
+def _tags(item: Mapping[str, object]) -> frozenset[str]:
+    return frozenset(t for t in str(item.get("tags", "")).split(";") if t)
+
+
+def _ours(vm: Mapping[str, object], names: Mapping[int, str]) -> bool:
+    vmid = vm.get("vmid")
+    return isinstance(vmid, int) and vmid in names and vm.get("name") == names[vmid] and TAG in _tags(vm)
 
 
 def _int(value: object) -> int:

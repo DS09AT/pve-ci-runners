@@ -353,6 +353,37 @@ def test_a_build_without_room_gives_up_without_starting_anything(setup, tmp_path
     assert not draining(config.daemon.state_dir) and reserved_mb(config.daemon.state_dir) == 0
 
 
+def test_the_build_vm_is_not_counted_twice(setup) -> None:
+    config, host = setup
+    host.total_mb = host.other_guests_mb + config.capacity.host_reserve_mb + config.template.memory_mb
+
+    TemplateBuilder(config, host, clock=lambda: 1.0, sleep=_no_wait, fetch=lambda *_: Path("/i")).build()
+
+    assert "start 9201" in host.events
+
+
+@pytest.mark.parametrize(("name", "tags"), [("ci-runner-template-9202", {TAG}), ("windows", set())])
+def test_a_vm_on_the_other_template_vmid_counts_during_a_build(setup, name: str, tags: set[str]) -> None:
+    config, host = setup
+    host.total_mb = host.other_guests_mb + config.capacity.host_reserve_mb + config.template.memory_mb
+    host.machines[9202] = FakeVm(name=name, memory_mb=1, tags=tags)
+    now = [0.0]
+
+    def time_passes(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(PveCiError, match="no room"):
+        TemplateBuilder(
+            config, host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
+        ).build()
+
+    assert not any(e.startswith("create") for e in host.events)
+
+
+def _no_wait(_: float) -> None:
+    raise AssertionError("the build waited for room it already had")
+
+
 def test_an_operators_drain_outlasts_the_build(setup, tmp_path: Path) -> None:
     config, _ = setup
     host = busy_host(tmp_path)
