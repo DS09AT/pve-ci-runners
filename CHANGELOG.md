@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.3.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.3.0...v0.3.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* read the datacenter firewall option from cluster.fw ([8e94381](https://github.com/DS09AT/pve-ci-runners/commit/8e943812c4c8873be0335655eb8d9bded1c161c1))
+
 ## [0.3.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.2...v0.3.0) (2026-11-22)
 
 
