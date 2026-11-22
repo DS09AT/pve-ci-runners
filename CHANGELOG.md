@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.2.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.1...v0.2.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* keep the memory of every other guest free, running or not ([8a6b995](https://github.com/DS09AT/pve-ci-runners/commit/8a6b99525c2ec623bdd98b8de494bde5eb0a8274))
+* keep the memory of every other guest free, running or not ([698530f](https://github.com/DS09AT/pve-ci-runners/commit/698530f74b0a06d6a39dd63e67b55659edcb11c3))
+
 ## [0.2.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.2.0...v0.2.1) (2026-11-21)
 
 
