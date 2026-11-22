@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.3.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.3.1...v0.3.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* re-assert the overflow variable and tolerate a VM gone at destroy ([da935f8](https://github.com/DS09AT/pve-ci-runners/commit/da935f8986c10ef1e50911426dc569141282d315))
+
 ## [0.3.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.3.0...v0.3.1) (2026-11-22)
 
 
