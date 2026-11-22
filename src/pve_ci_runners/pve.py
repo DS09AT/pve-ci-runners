@@ -190,11 +190,24 @@ class Pve:
             raise CommandError(f"VM {vmid}: its out-of-memory priority could not be set")
 
     def destroy(self, vmid: int) -> None:
-        """Stops and removes a VM with its disks and firewall file."""
+        """Stops and removes a VM with its disks and firewall file; a VM already gone counts as removed."""
         self._commands.run(["qm", "stop", str(vmid), "--skiplock", "1"], timeout=180)
-        output(self._commands, ["qm", "destroy", str(vmid), "--purge", "1"], timeout=300)
+        try:
+            output(self._commands, ["qm", "destroy", str(vmid), "--purge", "1"], timeout=300)
+        except CommandError:
+            # A teardown and the controller can both remove the same idle VM; the slower one finds it gone.
+            if self._vmid_in_use(vmid):
+                raise
         # The VMID is free cluster-wide now, so no other guest's rules can sit in this file.
         (self._firewall_dir / f"{vmid}.fw").unlink(missing_ok=True)
+
+    def _vmid_in_use(self, vmid: int) -> bool:
+        """Whether any guest on any node of the cluster has the VMID."""
+        argv = ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"]
+        listing = self._json(argv)
+        if not isinstance(listing, list):
+            raise CommandError("pvesh get /cluster/resources returned no list")
+        return any(item.get("vmid") == vmid for item in _dicts(listing))
 
     def attach(
         self, vmid: int, disk: str, device: str, serial: str, *, limits: Sequence[tuple[str, int]]

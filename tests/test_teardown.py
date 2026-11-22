@@ -5,13 +5,13 @@ import pytest
 from pve_ci_runners.config import Config, parse
 from pve_ci_runners.drain import draining, reserve, reserved_mb
 from pve_ci_runners.errors import GitHubError, PveCiError
-from pve_ci_runners.pve import TAG
+from pve_ci_runners.pve import TAG, Pve
 from pve_ci_runners.state import CacheLease, VmState
 from pve_ci_runners.teardown import Teardown
 from pve_ci_runners.template_build import template_lock
 from pve_ci_runners.templates import TemplateMarker
 from tests.conftest import config_data
-from tests.fakes import FakeCache, FakeGitHub, FakeHost, FakeVm
+from tests.fakes import FakeCache, FakeGitHub, FakeHost, FakeVm, Script, done
 
 RUNNER = "ci-runner-121-abc123"
 LEASE = CacheLease(
@@ -193,3 +193,26 @@ def test_no_teardown_runs_beside_a_template_build(setup) -> None:
     with template_lock(config.daemon.state_dir), pytest.raises(PveCiError, match="template build"):
         teardown(config, host, github, cache, clock).run(purge_cache=True)
     assert 9201 in host.machines and not cache.purged
+
+
+def test_a_vm_the_controller_removed_after_the_listing_counts_as_removed(setup, tmp_path: Path) -> None:
+    config, _, github, cache, clock = setup
+    missing = done("", 2, "Configuration file 'nodes/pve1/qemu-server/121.conf' does not exist")
+    pve = Pve(
+        Script({("qm", "destroy"): missing, ("pvesh", "get", "/cluster/resources"): done([])}),
+        node="pve1",
+        firewall_dir=tmp_path,
+    )
+
+    class Racing(FakeHost):
+        def destroy(self, vmid: int) -> None:
+            # The controller retired the idle VM after teardown listed it, just before this destroy.
+            del self.machines[vmid]
+            pve.destroy(vmid)
+
+    host = Racing()
+    ours(host, 121, "ci-runner-121", VmState("warm", 9_000, "default", "0" * 16))
+    (tmp_path / "121.fw").write_text("[OPTIONS]\n", encoding="utf-8")
+
+    assert teardown(config, host, github, cache, clock).run(purge_cache=False) == []
+    assert not (tmp_path / "121.fw").exists()

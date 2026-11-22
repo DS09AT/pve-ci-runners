@@ -12,6 +12,10 @@ from typing import Protocol
 from pve_ci_runners.config import OverflowConfig
 from pve_ci_runners.errors import GitHubError
 
+# Another controller or a manual edit can overwrite the variable; an unchanged value is written again
+# after this long, so such a change lasts one interval at most.
+REASSERT_SECONDS = 600
+
 
 class VariableWriter(Protocol):
     """Writes one Actions variable of a repository."""
@@ -50,7 +54,7 @@ class Overflow:
         self._config = config
         self._writer = writer
         self._state = Hysteresis()
-        self._written: dict[str, str] = {}
+        self._written: dict[str, tuple[str, float]] = {}
 
     @property
     def on(self) -> bool:
@@ -58,7 +62,7 @@ class Overflow:
         return self._state.on
 
     def update(self, *, unserved: int, oldest_wait: float, now: float, forced: bool = False) -> list[str]:
-        """Applies the decision; returns one log line per change and one per failed write."""
+        """Applies the decision; returns one log line per switch, per write and per failed write."""
         before = self._state.on
         self._state = (
             Hysteresis(on=True)
@@ -70,16 +74,20 @@ class Overflow:
             lines.append(f"overflow {'on' if self._state.on else 'off'}: {unserved} jobs without a VM")
         value = self._config.hosted_value if self._state.on else self._config.self_value
         lines.extend(
-            self._write(repository, value)
+            self._write(repository, value, now)
             for repository in self._config.repositories
-            if self._written.get(repository) != value
+            if not self._current(repository, value, now)
         )
         return lines
 
-    def _write(self, repository: str, value: str) -> str:
+    def _current(self, repository: str, value: str, now: float) -> bool:
+        written = self._written.get(repository)
+        return written is not None and written[0] == value and now - written[1] < REASSERT_SECONDS
+
+    def _write(self, repository: str, value: str, now: float) -> str:
         try:
             self._writer.set_variable(repository, self._config.variable, value)
         except GitHubError as err:
             return f"{repository}: {self._config.variable} not updated: {err}"
-        self._written[repository] = value
+        self._written[repository] = (value, now)
         return f"{repository}: {self._config.variable} = {value}"
