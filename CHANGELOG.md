@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.5.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.1...v0.5.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* fail doctor while the guest bridge follows its ports ([4640dc7](https://github.com/DS09AT/pve-ci-runners/commit/4640dc71e335e67dd5fbb6c9970b6a421944d322))
+
 ## [0.5.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.0...v0.5.1) (2026-11-23)
 
 
