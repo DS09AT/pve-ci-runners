@@ -115,6 +115,14 @@ class TemplateHypervisor(Hypervisor, Protocol):
         ...
 
 
+class DiskSpace(Protocol):
+    """The free space where runner VMs and job caches write."""
+
+    def available(self) -> int | None:
+        """Bytes one more write could still use, or None when nothing there can be measured."""
+        ...
+
+
 class GitHubActions(Protocol):
     """The GitHub Actions operations of one App installation."""
 

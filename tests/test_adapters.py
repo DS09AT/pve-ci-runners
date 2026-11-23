@@ -1,13 +1,22 @@
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from pve_ci_runners.cache import NoCache
-from pve_ci_runners.cache_zfs import KEY_PROPERTY, PROMOTING_PROPERTY, RUN_PROPERTY, RUNNER_PROPERTY, ZfsCache
+from pve_ci_runners.cache_zfs import (
+    KEY_PROPERTY,
+    PROMOTING_PROPERTY,
+    RUN_PROPERTY,
+    RUNNER_PROPERTY,
+    USED_PROPERTY,
+    ZfsCache,
+)
 from pve_ci_runners.config import Config
+from pve_ci_runners.disk import DatasetSpace, ZfsSpace, dataset_space, disk_space
 from pve_ci_runners.drain import drain, draining, reserve, reserved_mb, resume
 from pve_ci_runners.errors import CommandError, GuestError
 from pve_ci_runners.logs import prune_logs
@@ -15,7 +24,7 @@ from pve_ci_runners.proc import HostCommands, output, succeeds
 from pve_ci_runners.pve import Pve, datacenter_firewall_enabled
 from pve_ci_runners.state import CacheLease
 from pve_ci_runners.templates import TemplateMarker, current_template, decode_marker
-from tests.fakes import Script, done
+from tests.fakes import Script, done, space
 
 
 def test_host_commands_report_exit_status_timeouts_and_missing_tools() -> None:
@@ -391,7 +400,8 @@ def zfs_cache(config: Config, script: Script, clock: float = 2_000_000_000.0) ->
     )
 
 
-ROOM = {("zfs", "get", "-Hp", "-o", "value", "available", "rpool/ci-cache"): done(f"{21 * 2**30}\n")}
+SPACE = ("zfs", "get", "-Hp", "-o", "property,value")
+ROOM = {SPACE: space(31 * 2**30)}
 RUNNER = "ci-runner-121-abc123"
 
 
@@ -414,7 +424,7 @@ def test_a_first_lease_creates_an_empty_formatted_cache(config: Config) -> None:
 
 
 def test_a_pool_without_room_for_one_more_volume_gives_no_cache(config: Config) -> None:
-    script = Script({("zfs", "get", "-Hp", "-o", "value", "available"): done(f"{20 * 2**30 - 1}\n")})
+    script = Script({SPACE: space(20 * 2**30 - 1)})
 
     assert zfs_cache(config, script).lease("o__r/ci__build", 121, runner=RUNNER, run_id=42) is None
     assert not [c for c in script.calls if c[:2] in (["zfs", "clone"], ["zfs", "snapshot"])]
@@ -528,49 +538,113 @@ def test_maintenance_finishes_an_interrupted_promotion_and_drops_a_half_done_one
     assert ["zfs", "destroy", "-r", "rpool/ci-cache/jobs/busy"] not in script.calls
 
 
-def test_maintenance_expires_old_caches_and_frees_a_full_pool(config: Config) -> None:
+def _snapshot_listing(golden: str) -> tuple[str, ...]:
+    return ("zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-s", "creation", "-d", "1", golden)
+
+
+GOLDENS = ("zfs", "list", "-H", "-p", "-o", f"name,{USED_PROPERTY}")
+JOBS = ("zfs", "list", "-H", "-o", f"name,{PROMOTING_PROPERTY},{KEY_PROPERTY}")
+
+
+def test_maintenance_expires_caches_unwritten_for_the_retention_period(config: Config) -> None:
     now = 2_000_000_000
     old, recent = now - 40 * 86400, now - 86400
     script = Script({
-        ("zfs", "list", "-H", "-o", f"name,{PROMOTING_PROPERTY},{KEY_PROPERTY}"): done(""),
+        JOBS: done(""),
         ("zfs", "list", "-H", "-o", "name", "-r"): done(
             "rpool/ci-cache/repos/a/old\nrpool/ci-cache/repos/a/new\n"
         ),
-        (
-            "zfs",
-            "list",
-            "-H",
-            "-t",
-            "snapshot",
-            "-o",
-            "name",
-            "-s",
-            "creation",
-            "-d",
-            "1",
-            "rpool/ci-cache/repos/a/old",
-        ): done(f"rpool/ci-cache/repos/a/old@g{old}\n"),
-        (
-            "zfs",
-            "list",
-            "-H",
-            "-t",
-            "snapshot",
-            "-o",
-            "name",
-            "-s",
-            "creation",
-            "-d",
-            "1",
-            "rpool/ci-cache/repos/a/new",
-        ): done(f"rpool/ci-cache/repos/a/new@g{recent}\n"),
-        ("zpool", "list"): [done("90%\n"), done("70%\n")],
+        _snapshot_listing("rpool/ci-cache/repos/a/old"): done(f"rpool/ci-cache/repos/a/old@g{old}\n"),
+        _snapshot_listing("rpool/ci-cache/repos/a/new"): done(f"rpool/ci-cache/repos/a/new@g{recent}\n"),
+        SPACE: space(100 * 2**30),
+        ("zpool", "list"): done("40%\n"),
     })
 
     lines = zfs_cache(config, script, clock=float(now)).maintain(set())
 
-    assert any("expired the cache rpool/ci-cache/repos/a/old" in line for line in lines)
-    assert any("pool at 90%" in line for line in lines)
+    assert lines == ["expired the cache rpool/ci-cache/repos/a/old, unused for 30 days"]
+    assert ["zfs", "destroy", "-r", "rpool/ci-cache/repos/a/new"] not in script.calls
+
+
+def test_maintenance_evicts_the_least_recently_used_caches_until_the_free_reserve_is_back(
+    config: Config,
+) -> None:
+    script = Script({
+        JOBS: done("rpool/ci-cache/jobs/a.busy-121-1\t-\ta/busy\n"),
+        GOLDENS: done(
+            "rpool/ci-cache/repos/a/busy\t100\n"
+            "rpool/ci-cache/repos/a/recent\t300\n"
+            "rpool/ci-cache/repos/a/stale\t-\n"
+            "rpool/ci-cache/repos/a/read\t200\n"
+        ),
+        _snapshot_listing("rpool/ci-cache/repos/a/stale"): done("rpool/ci-cache/repos/a/stale@g150\n"),
+        SPACE: [space(2**30), space(2**30), space(31 * 2**30)],
+        ("zpool", "list"): done("40%\n"),
+    })
+
+    lines = zfs_cache(config, script, clock=1000.0).maintain({"rpool/ci-cache/jobs/a.busy-121-1"})
+
+    reserve = config.cache.free_reserve_gb * 2**30
+    assert lines == [
+        f"only {2**30} bytes available, {reserve} reserved: evicted the cache rpool/ci-cache/repos/a/stale",
+        f"only {2**30} bytes available, {reserve} reserved: evicted the cache rpool/ci-cache/repos/a/read",
+    ]
+    assert ["zfs", "destroy", "-r", "rpool/ci-cache/repos/a/busy"] not in script.calls, "a clone uses it"
+    assert ["zfs", "destroy", "-r", "rpool/ci-cache/repos/a/recent"] not in script.calls
+
+
+def test_maintenance_still_frees_a_pool_above_its_high_water_mark(config: Config) -> None:
+    script = Script({
+        JOBS: done(""),
+        GOLDENS: done("rpool/ci-cache/repos/a/one\t1\nrpool/ci-cache/repos/a/two\t2\n"),
+        SPACE: space(100 * 2**30),
+        ("zpool", "list"): [done("90%\n"), done("70%\n")],
+    })
+
+    lines = zfs_cache(config, script).maintain(set())
+
+    assert lines == ["pool at 90%: evicted the cache rpool/ci-cache/repos/a/one"]
+
+
+def test_a_cache_that_cannot_be_destroyed_is_passed_over(config: Config) -> None:
+    script = Script({
+        JOBS: done(""),
+        GOLDENS: done("rpool/ci-cache/repos/a/one\t1\nrpool/ci-cache/repos/a/two\t2\n"),
+        ("zfs", "destroy", "-r", "rpool/ci-cache/repos/a/one"): done("", 1),
+        SPACE: [space(0), space(0), space(100 * 2**30)],
+        ("zpool", "list"): done("40%\n"),
+    })
+
+    lines = zfs_cache(config, script).maintain(set())
+
+    assert len(lines) == 1 and lines[0].endswith("evicted the cache rpool/ci-cache/repos/a/two")
+
+
+def test_a_lease_evicts_other_caches_first_and_never_its_own_or_one_in_use(config: Config) -> None:
+    key = "o__r/ci__build"
+    script = Script({
+        JOBS: done("rpool/ci-cache/jobs/a.busy-122-1\t-\ta/busy\n"),
+        GOLDENS: done(
+            f"rpool/ci-cache/repos/{key}\t1\nrpool/ci-cache/repos/a/busy\t2\nrpool/ci-cache/repos/a/old\t3\n"
+        ),
+        SPACE: [space(5 * 2**30), space(5 * 2**30), space(31 * 2**30)],
+        ("zpool", "list"): done("40%\n"),
+        ("zfs", "list", "-H", "-t", "snapshot"): done(f"rpool/ci-cache/repos/{key}@g1\n"),
+    })
+
+    attachment = zfs_cache(config, script).lease(key, 121, runner=RUNNER, run_id=42)
+
+    assert attachment is not None
+    destroyed = [c[3] for c in script.calls if c[:3] == ["zfs", "destroy", "-r"]]
+    assert destroyed == ["rpool/ci-cache/repos/a/old"]
+    assert ["zfs", "set", f"{USED_PROPERTY}=2000000000", f"rpool/ci-cache/repos/{key}"] in script.calls
+
+
+def test_a_lease_with_room_evicts_nothing(config: Config) -> None:
+    script = Script({**ROOM, ("zfs", "list", "-H", "-t", "snapshot"): done("x@g1\n")})
+
+    assert zfs_cache(config, script).lease("o__r/ci__build", 121, runner=RUNNER, run_id=42) is not None
+    assert not [c for c in script.calls if c[:2] in (["zfs", "destroy"], ["zpool", "list"])]
 
 
 def test_a_device_that_never_appears_is_an_error(config: Config) -> None:
@@ -667,3 +741,59 @@ def test_the_datacenter_firewall_option_is_read_from_cluster_fw(text: str, enabl
     script = Script({("cat", "/etc/pve/firewall/cluster.fw"): done(text)})
 
     assert datacenter_firewall_enabled(script) is enabled
+
+
+def _zfs_space(dataset: str) -> tuple[str, ...]:
+    return (*SPACE, "available,used,quota", dataset)
+
+
+def test_dataset_space_reads_available_used_and_quota_in_any_order() -> None:
+    script = Script({SPACE: done("quota\t64424509440\nused\t64382566400\navailable\t41943040\n")})
+
+    found = dataset_space(script, "rpool/ci")
+
+    assert found == DatasetSpace("rpool/ci", 41943040, 64382566400, 64424509440)
+    assert script.calls == [["zfs", "get", "-Hp", "-o", "property,value", "available,used,quota", "rpool/ci"]]
+
+
+@pytest.mark.parametrize("text", ["", "available\t-\nused\t1\nquota\t0\n", "available\t1\nused\t1\n"])
+def test_dataset_space_without_every_number_is_an_error(text: str) -> None:
+    with pytest.raises(CommandError, match="no space for rpool/ci"):
+        dataset_space(Script({SPACE: done(text)}), "rpool/ci")
+
+
+STORAGE = ("pvesh", "get", "/storage/local-zfs")
+
+
+def test_the_tightest_of_the_storage_and_cache_datasets_decides(config: Config) -> None:
+    script = Script({
+        STORAGE: done({"type": "zfspool", "pool": "rpool/data"}),
+        _zfs_space("rpool/data"): space(50 * 2**30),
+        _zfs_space("rpool/ci-cache"): space(7 * 2**30, quota=60 * 2**30),
+    })
+
+    measured = disk_space(config, script)
+
+    assert measured.available() == 7 * 2**30
+    assert [s.dataset for s in measured.spaces()] == ["rpool/data", "rpool/ci-cache"]
+
+
+def test_a_dataset_shared_by_the_storage_and_the_cache_is_measured_once() -> None:
+    script = Script({STORAGE: done({"type": "zfspool", "pool": "rpool/ci"}), SPACE: space(2**30)})
+
+    assert ZfsSpace(script, storage="local-zfs", cache_dataset="rpool/ci").available() == 2**30
+    assert len([c for c in script.calls if c[:2] == ["zfs", "get"]]) == 1
+
+
+def test_without_any_zfs_dataset_nothing_is_measured(config: Config) -> None:
+    script = Script({STORAGE: done({"type": "lvmthin", "thinpool": "data"})})
+
+    assert (
+        disk_space(replace(config, cache=replace(config.cache, backend="none")), script).available() is None
+    )
+
+
+@pytest.mark.parametrize("answer", [done("not json"), done({"type": "zfspool"})])
+def test_a_storage_whose_dataset_is_unknown_is_an_error(answer) -> None:
+    with pytest.raises(CommandError, match="local-zfs"):
+        ZfsSpace(Script({STORAGE: answer}), storage="local-zfs", cache_dataset=None).available()

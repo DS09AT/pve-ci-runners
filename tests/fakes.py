@@ -66,6 +66,14 @@ class FakeHost:
         self.uncreatable: set[int] = set()
         self.protected: set[int] = set()
         self.unprotectable: set[int] = set()
+        self.disk_bytes: int | None = 2**50
+        self.disk_error = False
+
+    def available(self) -> int | None:
+        """The host doubles as the disk port: free bytes where runner VMs write."""
+        if self.disk_error:
+            raise CommandError("zfs get exited 1: dataset is busy")
+        return self.disk_bytes
 
     def add_template(self, vmid: int, built_at: int = 100) -> None:
         marker = TemplateMarker(built_at=built_at, runner_version="2.338.2").encode()
@@ -320,6 +328,11 @@ class Script:
                     else (answer[0] if isinstance(answer, list) else answer)
                 )
         return Completed(0, "", "")
+
+
+def space(available: int, used: int = 0, quota: int = 0) -> Completed:
+    """What `zfs get -Hp -o property,value available,used,quota` prints."""
+    return Completed(0, f"available\t{available}\nused\t{used}\nquota\t{quota}\n", "")
 
 
 def done(stdout: object = "", code: int = 0, stderr: str = "") -> Completed:

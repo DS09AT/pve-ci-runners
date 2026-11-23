@@ -373,3 +373,53 @@ def test_the_uv_cache_is_cached_where_the_runner_points_uv() -> None:
     assert f"Environment=UV_CACHE_DIR={uv.path}\n" in prepare, (
         "setup-uv would fall back to a per-job temp dir"
     )
+
+
+def test_disk_reserves_and_the_health_threshold_have_safe_defaults() -> None:
+    config = parse(config_data())
+
+    assert config.capacity.disk_reserve_gb == 10
+    assert config.capacity.disk_reserve_bytes == 10 * 2**30
+    assert config.cache.free_reserve_gb == 30, "one reserve per slot and one for a template build"
+    assert config.daemon.unhealthy_checks == 3
+    assert config.template.disk_gb == 40
+
+
+def test_the_free_reserve_follows_the_disk_reserve_unless_it_is_set() -> None:
+    data = config_data()
+    data["capacity"]["disk_reserve_gb"] = 4
+    assert parse(data).cache.free_reserve_gb == 12
+    data["cache"]["free_reserve_gb"] = 0
+    assert parse(data).cache.free_reserve_gb == 0
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("capacity", "disk_reserve_gb", 0),
+        ("cache", "free_reserve_gb", -1),
+        ("daemon", "unhealthy_checks", 0),
+        ("daemon", "unhealthy_checks", 101),
+    ],
+)
+def test_disk_reserves_and_the_health_threshold_are_bounded(section: str, key: str, value: int) -> None:
+    data = config_data()
+    data.setdefault(section, {})[key] = value
+
+    with pytest.raises(ConfigError, match="must be between"):
+        parse(data)
+
+
+def test_a_large_thin_template_disk_is_accepted() -> None:
+    data = config_data()
+    data["template"]["disk_gb"] = 80
+
+    assert parse(data).template.disk_gb == 80
+
+
+def test_the_assign_timeout_defaults_to_ten_minutes_and_stays_below_the_job_lifetime() -> None:
+    assert parse(config_data()).daemon.assign_timeout_seconds == 600
+    data = config_data(daemon={"assign_timeout_seconds": 23400})
+
+    with pytest.raises(ConfigError, match="assign_timeout_seconds"):
+        parse(data)

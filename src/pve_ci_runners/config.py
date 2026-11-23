@@ -70,6 +70,12 @@ class CapacityConfig:
 
     memory_mb: int
     host_reserve_mb: int
+    disk_reserve_gb: int
+
+    @property
+    def disk_reserve_bytes(self) -> int:
+        """The free space kept for each runner or build VM before another one starts."""
+        return self.disk_reserve_gb * 2**30
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,7 @@ class CacheConfig:
     wipe_above_mb: int
     docker_keep_storage_gb: int
     pool_high_water_percent: int
+    free_reserve_gb: int
     min_write_mb: int
     mounts: tuple[CacheMount, ...]
 
@@ -196,12 +203,14 @@ class DaemonConfig:
 
     poll_seconds: int
     idle_timeout_seconds: int
+    assign_timeout_seconds: int
     boot_timeout_seconds: int
     max_job_seconds: int
     name_prefix: str
     log_dir: Path
     log_retention_days: int
     state_dir: Path
+    unhealthy_checks: int
 
 
 @dataclass(frozen=True)
@@ -242,13 +251,16 @@ def parse(data: dict[str, object]) -> Config:
     root = Section(data, "")
     network = _network(_required(root, "network"))
     profiles = tuple(_profile(s) for s in root.sections("profile", minimum=1))
+    capacity = _capacity(_required(root, "capacity"))
+    slots = tuple(_slot(s) for s in root.sections("slot", minimum=1))
     config = Config(
         github=_github(_required(root, "github")),
-        capacity=_capacity(_required(root, "capacity")),
+        capacity=capacity,
         network=network,
-        slots=tuple(_slot(s) for s in root.sections("slot", minimum=1)),
+        slots=slots,
         profiles=profiles,
-        cache=_cache(root.section("cache")),
+        # Room for every slot and one template build, so eviction alone lets all of them start.
+        cache=_cache(root.section("cache"), (len(slots) + 1) * capacity.disk_reserve_gb),
         firewall=_firewall(root.section("firewall")),
         overflow=_overflow(root.section("overflow"), profiles),
         template=_template(_required(root, "template")),
@@ -303,6 +315,7 @@ def _capacity(s: Section) -> CapacityConfig:
     result = CapacityConfig(
         memory_mb=s.number("memory_mb", minimum=1024),
         host_reserve_mb=s.number("host_reserve_mb", default=4096, minimum=0),
+        disk_reserve_gb=s.number("disk_reserve_gb", default=10, minimum=1, maximum=4096),
     )
     s.done()
     return result
@@ -369,7 +382,7 @@ def _positive(s: Section, key: str, value: str | int) -> int:
     return value
 
 
-def _cache(s: Section | None) -> CacheConfig:
+def _cache(s: Section | None, free_reserve_gb: int) -> CacheConfig:
     s = s or Section({}, "cache")
     backend = s.text("backend", default="zfs", pattern="zfs|none")
     result = CacheConfig(
@@ -384,6 +397,7 @@ def _cache(s: Section | None) -> CacheConfig:
         wipe_above_mb=s.number("wipe_above_mb", default=17000, minimum=100),
         docker_keep_storage_gb=s.number("docker_keep_storage_gb", default=8, minimum=0),
         pool_high_water_percent=s.number("pool_high_water_percent", default=80, minimum=50, maximum=95),
+        free_reserve_gb=s.number("free_reserve_gb", default=free_reserve_gb, minimum=0, maximum=1_000_000),
         min_write_mb=s.number("min_write_mb", default=1, minimum=0),
         mounts=_mounts(s),
     )
@@ -523,6 +537,7 @@ def _daemon(s: Section | None) -> DaemonConfig:
     result = DaemonConfig(
         poll_seconds=s.number("poll_seconds", default=15, minimum=5, maximum=300),
         idle_timeout_seconds=s.number("idle_timeout_seconds", default=600, minimum=60),
+        assign_timeout_seconds=s.number("assign_timeout_seconds", default=600, minimum=60),
         boot_timeout_seconds=s.number("boot_timeout_seconds", default=300, minimum=60),
         # Above GitHub's default job timeout of six hours, so only a VM that outlived its job is cut off.
         max_job_seconds=s.number("max_job_seconds", default=23400, minimum=3600, maximum=604800),
@@ -530,10 +545,11 @@ def _daemon(s: Section | None) -> DaemonConfig:
         log_dir=Path(s.absolute_path("log_dir", default="/var/log/pve-ci-runners")),
         log_retention_days=s.number("log_retention_days", default=14, minimum=1, maximum=3650),
         state_dir=Path(s.absolute_path("state_dir", default="/var/lib/pve-ci-runners")),
+        unhealthy_checks=s.number("unhealthy_checks", default=3, minimum=1, maximum=100),
     )
     s.done()
-    if result.max_job_seconds <= result.idle_timeout_seconds:
-        raise s.error("max_job_seconds", "must exceed idle_timeout_seconds")
+    if result.max_job_seconds <= max(result.idle_timeout_seconds, result.assign_timeout_seconds):
+        raise s.error("max_job_seconds", "must exceed idle_timeout_seconds and assign_timeout_seconds")
     return result
 
 

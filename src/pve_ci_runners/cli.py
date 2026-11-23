@@ -13,6 +13,7 @@ from pve_ci_runners.actions import Actions
 from pve_ci_runners.cache import CacheBackend, NoCache
 from pve_ci_runners.cache_zfs import ZfsCache
 from pve_ci_runners.controller import Controller
+from pve_ci_runners.disk import disk_space
 from pve_ci_runners.doctor import Doctor, report_json
 from pve_ci_runners.drain import drain, resume
 from pve_ci_runners.errors import PveCiError
@@ -128,7 +129,8 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _build_template(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
-    vmid, version = TemplateBuilder(configuration.load(args.config), Pve(HostCommands())).build()
+    loaded, commands = configuration.load(args.config), HostCommands()
+    vmid, version = TemplateBuilder(loaded, Pve(commands), disk=disk_space(loaded, commands)).build()
     print(f"template {vmid} built with runner {version}")
     return 0
 
@@ -145,7 +147,14 @@ def _run(args: argparse.Namespace) -> int:
     commands = HostCommands()
     actions = Actions(_client(loaded, commands), allowed=loaded.github.repositories)
     overflow = Overflow(loaded.overflow, actions) if loaded.overflow else None
-    controller = Controller(loaded, Pve(commands), actions, _cache(loaded, commands), overflow=overflow)
+    controller = Controller(
+        loaded,
+        Pve(commands),
+        actions,
+        _cache(loaded, commands),
+        disk=disk_space(loaded, commands),
+        overflow=overflow,
+    )
     log.info(
         "controller %s up: %d slots, profiles %s",
         VERSION,

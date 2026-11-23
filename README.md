@@ -114,6 +114,7 @@ app_key_file = "/etc/pve-ci-runners/app.pem"  # the App's private key, mode 0600
 [capacity]
 memory_mb = 20480        # all runner VMs together
 host_reserve_mb = 4096   # never start a VM if the host would keep less than this for its other guests
+# disk_reserve_gb = 10   # free disk space kept per runner or build VM before another one starts
 
 [network]
 bridge = "vmbr1"         # a NAT bridge that only runner VMs use
@@ -144,10 +145,12 @@ qm_options = { cpuunits = 100 }        # lower CPU priority than the host's othe
 [cache]
 backend = "zfs"                        # or "none"
 dataset = "rpool/ci-cache"
+# free_reserve_gb = 30                 # evict caches below this; default: (slots + 1) * disk_reserve_gb
 
 [template]
 vmids = [9201, 9202]                   # two template VMIDs that take turns
-storage = "local-zfs"                  # where templates and their linked clones live
+storage = "local-zfs"                  # where templates and their linked clones live; sparse on ZFS
+# disk_gb = 40                         # the template disk's size; thin, so only what is written counts
 address = "192.168.100.20"             # the build VM's address on the bridge
 # A dated cloud image and the SHA-256 published next to it; the build refuses any other bytes.
 image_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260101/ubuntu-24.04-server-cloudimg-amd64.img"
@@ -174,6 +177,36 @@ management `validate` step.
 running or not, because a stopped VM may boot at any moment and runner VMs give way to it.
 `pve-ci-runners doctor` fails its `guest memory` check when the physical memory cannot hold those guests,
 the reserve and `capacity.memory_mb` together.
+
+Runner VMs, template builds and job caches all write into thin volumes, so nothing but free space stops a
+job from filling the dataset they share. The controller measures that space as ZFS reports it in
+`available` for the datasets of `template.storage` and `cache.dataset`, which already honours each
+dataset's quota and refquota, the quotas of its ancestors and the free space of the pool:
+
+- A VM is created, or a warm VM takes a job, only while the space covers `capacity.disk_reserve_gb` for
+  every VM that would then run. A template build waits for one reserve more than the runner VMs hold,
+  and the controller keeps that reserve free while the build runs. The reserve, not `template.disk_gb`,
+  therefore bounds what jobs may write before new work stops; a larger thin template disk costs nothing
+  until it is written.
+- As soon as the space holds fewer reserves than there are free slots, the least recently used caches
+  that no running job uses are evicted in the same cycle until `cache.free_reserve_gb` is free again; only
+  when even the present VMs lack their reserve are idle VMs retired as well. Jobs that still cannot get a
+  VM count as unserved at once, so `[overflow]` takes them, and the controller measures again every cycle
+  and resumes on its own once space is back. Space that cannot be measured starts and assigns nothing.
+- The hourly maintenance evicts the same way, and also while the pool is above
+  `cache.pool_high_water_percent`. A job only gets a cache while one more volume fits after eviction.
+
+On a `zfspool` storage, set `sparse 1`; otherwise every disk Proxmox creates there, the template's
+included, reserves its full size. `pve-ci-runners doctor` warns when the space cannot hold a reserve for
+every slot and a template build, and fails when it cannot hold one.
+
+A runner VM whose guest fails `daemon.unhealthy_checks` (default 3) checks in a row, for example because
+its disk returns I/O errors or its guest agent no longer answers, is retired: its cache is discarded, its
+runner registration is removed and its slot takes a new VM. These checks run in the background, so a guest
+that hangs until its timeout holds up no other VM. A runner that has not started a job
+`daemon.assign_timeout_seconds` (default 600) after it was registered is retired the same way, even while
+jobs of its repository wait, so another VM serves them; without waiting jobs, an idle runner goes after
+`daemon.idle_timeout_seconds` as before.
 
 Every runner and build VM's firewall drops egress to the private, shared, link-local, multicast and IPv6
 ranges, and to an IP set `deny` holding `firewall.deny_destinations` (IPv4 or IPv6 networks) plus every

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from pve_ci_runners.cache import Attachment
 from pve_ci_runners.config import CacheConfig
+from pve_ci_runners.disk import dataset_space
 from pve_ci_runners.errors import CommandError
 from pve_ci_runners.proc import Commands, output, succeeds
 from pve_ci_runners.state import CacheLease
@@ -25,6 +26,7 @@ KEY_PROPERTY = "pve-ci-runners:key"
 RUNNER_PROPERTY = "pve-ci-runners:runner"
 RUN_PROPERTY = "pve-ci-runners:run"
 PROMOTING_PROPERTY = "pve-ci-runners:promoting"
+USED_PROPERTY = "pve-ci-runners:used"
 _IDENTITY = f"{KEY_PROPERTY},{RUNNER_PROPERTY},{RUN_PROPERTY}"
 _DEVICE_WAIT = 10.0
 log = logging.getLogger("pve_ci_runners")
@@ -53,18 +55,23 @@ class ZfsCache:
     def lease(self, key: str, vmid: int, *, runner: str, run_id: int) -> Attachment | None:
         """A clone of the newest snapshot of the key's golden volume, created empty on first use.
 
-        None when the pool has less room left than one volume: clones are sparse, so a job could otherwise
-        fill a pool that other guests share.
+        Least recently used caches are evicted first when the dataset lacks room for one volume above the
+        free reserve. None when even that leaves less room than one volume: clones are sparse, so a job
+        could otherwise fill the space the runner VMs write to.
         """
         self._zfs("create", "-p", self.jobs)
-        available = int(self._zfs("get", "-Hp", "-o", "value", "available", self._config.dataset).strip())
-        if available < _bytes(self._config.volume_size):
-            log.warning("cache pool has only %d bytes left; the job runs without a cache", available)
+        volume = _bytes(self._config.volume_size)
+        if self._available() < max(volume, self._free_reserve()):
+            self._evict({key} | self._clone_keys(), max(volume, self._free_reserve()))
+        available = self._available()
+        if available < volume:
+            log.warning("the cache dataset has only %d bytes left; the job runs without a cache", available)
             return None
         origin = self._golden_snapshot(key)
         clone = f"{self._clone_prefix(key, vmid)}{int(self._clock())}"
         identity = ("-o", f"{RUNNER_PROPERTY}={runner}", "-o", f"{RUN_PROPERTY}={run_id}")
         self._zfs("clone", "-o", f"{KEY_PROPERTY}={key}", *identity, origin, clone)
+        self._zfs("set", f"{USED_PROPERTY}={int(self._clock())}", f"{self.repos}/{key}")
         return Attachment(CacheLease(key=key, clone=clone, origin=origin), self._device(clone))
 
     def written_bytes(self, lease: CacheLease, vmid: int) -> int:
@@ -100,10 +107,14 @@ class ZfsCache:
             self._commands.run(["zfs", "destroy", "-r", lease.clone], timeout=300)
 
     def maintain(self, in_use: set[str]) -> list[str]:
-        """Finishes interrupted write-backs, removes orphans and expired caches, then frees the pool."""
+        """Finishes interrupted write-backs, removes orphans and expired caches, then frees the dataset.
+
+        A cache a remaining clone was made from is never evicted: its clone depends on its snapshot.
+        """
         lines = self._recover()
         lines += self._remove_orphans(in_use)
         lines += self._expire()
+        lines += self._evict(self._clone_keys(), self._free_reserve())
         return lines
 
     def purge(self) -> None:
@@ -186,22 +197,58 @@ class ZfsCache:
 
     def _expire(self) -> list[str]:
         goldens = self._volumes(self.repos, recursive=True)
-        written = {g: int((self._snapshots(g) or ["@g0"])[-1].rsplit("@g", 1)[-1] or 0) for g in goldens}
-        oldest_first = sorted(goldens, key=written.__getitem__)
         limit = self._clock() - self._config.retention_days * 86400
-        lines = [
+        return [
             f"expired the cache {g}, unused for {self._config.retention_days} days"
-            for g in oldest_first
-            if written[g] < limit and succeeds(self._commands, ["zfs", "destroy", "-r", g])
+            for g in goldens
+            if self._written(g) < limit and succeeds(self._commands, ["zfs", "destroy", "-r", g])
         ]
-        pool = self._config.dataset.split("/", 1)[0]
-        for golden in oldest_first:
-            capacity = int(self._zpool_capacity(pool))
-            if capacity < self._config.pool_high_water_percent:
+
+    def _evict(self, protected: set[str], reserve: int) -> list[str]:
+        """Destroys the least recently used caches until the dataset and the pool have room again."""
+        lines: list[str] = []
+        for golden in self._least_recently_used(protected):
+            shortage = self._shortage(reserve)
+            if not shortage:
                 break
             if succeeds(self._commands, ["zfs", "destroy", "-r", golden]):
-                lines.append(f"pool at {capacity}%: evicted the cache {golden}")
+                lines.append(f"{shortage}: evicted the cache {golden}")
         return lines
+
+    def _shortage(self, reserve: int) -> str:
+        """Why the cache must shrink, or nothing; the pool's capacity bounds the dataset's free space."""
+        available = self._available()
+        if available < reserve:
+            return f"only {available} bytes available, {reserve} reserved"
+        capacity = int(self._zpool_capacity(self._config.dataset.split("/", 1)[0]))
+        return f"pool at {capacity}%" if capacity >= self._config.pool_high_water_percent else ""
+
+    def _least_recently_used(self, protected: set[str]) -> list[str]:
+        listing = self._commands.run(
+            ["zfs", "list", "-H", "-p", "-o", f"name,{USED_PROPERTY}", "-r", "-t", "volume", self.repos],
+            timeout=60,
+        )
+        rows = [line.split("\t") for line in listing.stdout.splitlines() if line.strip()]
+        prefix = f"{self.repos}/"
+        used = {
+            r[0]: max(int(r[1]) if r[1].isdecimal() else 0, self._written(r[0]))
+            for r in rows
+            if len(r) == 2 and r[0].removeprefix(prefix) not in protected  # noqa: PLR2004 - two requested columns
+        }
+        return sorted(used, key=used.__getitem__)
+
+    def _written(self, golden: str) -> int:
+        """When the cache was last written back: its newest snapshot carries the time."""
+        return int((self._snapshots(golden) or ["@g0"])[-1].rsplit("@g", 1)[-1] or 0)
+
+    def _clone_keys(self) -> set[str]:
+        return {key for _, _, key in self._job_volumes()}
+
+    def _available(self) -> int:
+        return dataset_space(self._commands, self._config.dataset).available
+
+    def _free_reserve(self) -> int:
+        return self._config.free_reserve_gb * 2**30
 
     def _job_volumes(self) -> list[tuple[str, str, str]]:
         listing = self._commands.run(

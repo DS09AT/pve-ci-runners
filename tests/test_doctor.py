@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from pve_ci_runners.doctor import Doctor, Finding
 from pve_ci_runners.drain import reserve
 from pve_ci_runners.pve import TAG
 from tests.conftest import config_data
-from tests.fakes import FakeHost, FakeVm, Script, done
+from tests.fakes import FakeHost, FakeVm, Script, done, space
 
 HEALTHY = {
     ("cat", "/etc/pve/firewall/cluster.fw"): done("[OPTIONS]\npolicy_in: DROP\nenable: 1\n"),
@@ -16,11 +17,17 @@ HEALTHY = {
     ]),
     ("sysctl", "-n", "net.ipv4.ip_forward"): done("1\n"),
     ("nft", "list", "ruleset"): done('\t\tip saddr 192.168.100.0/24 oifname "eno1" masquerade\n'),
-    ("pvesh", "get", "/storage/local-zfs"): done({"type": "zfspool", "content": "images,rootdir"}),
+    ("pvesh", "get", "/storage/local-zfs"): done({
+        "type": "zfspool",
+        "content": "images,rootdir",
+        "pool": "rpool/data",
+        "sparse": 1,
+    }),
     ("pvesh", "get", "/storage/local"): done({"type": "dir", "content": "iso,snippets,vztmpl"}),
     ("zfs", "list", "-H", "-o", "name", "rpool/ci-cache"): done("rpool/ci-cache\n"),
     ("pvesh", "get", "/cluster/backup"): done([]),
     ("cat", "/proc/spl/kstat/zfs/arcstats"): done(f"c_max                           4    {2 * 2**30}\n"),
+    ("zfs", "get", "-Hp", "-o", "property,value"): space(100 * 2**30),
 }
 ALL_GRANTED = {
     "administration": "write",
@@ -270,3 +277,59 @@ def test_arcstats_that_cannot_be_read_or_parsed_on_a_zfs_host_fail_the_check(con
     finding = run(config, {**HEALTHY, ("cat", "/proc/spl/kstat/zfs/arcstats"): answer})["memory reserve"]
 
     assert finding.level == "fail" and finding.detail.startswith("could not be checked")
+
+
+CACHE_SPACE = ("zfs", "get", "-Hp", "-o", "property,value", "available,used,quota", "rpool/ci-cache")
+
+
+@pytest.mark.parametrize(
+    ("available", "level", "words"),
+    [
+        (5 * 2**30, "fail", "less than one VM's 10 GiB reserve"),
+        (25 * 2**30, "warn", "less than 2 slots and a template build at 10 GiB each (30 GiB)"),
+        (30 * 2**30, "ok", "enough for every slot and a template build"),
+    ],
+)
+def test_disk_space_must_hold_a_reserve_for_every_slot_and_a_build(
+    config: Config, available: int, level: str, words: str
+) -> None:
+    answers = {**HEALTHY, CACHE_SPACE: space(available, used=2**30, quota=60 * 2**30)}
+
+    finding = run(config, answers)["disk space"]
+
+    assert finding.level == level and words in finding.detail
+    assert "rpool/ci-cache has" in finding.detail and "quota 60.0 GiB" in finding.detail
+    assert bool(finding.fix) == (level != "ok")
+
+
+def test_disk_space_without_a_quota_names_none(config: Config) -> None:
+    finding = run(config, {**HEALTHY, CACHE_SPACE: space(5 * 2**30)})["disk space"]
+
+    assert finding.level == "fail" and "quota" not in finding.detail
+
+
+def test_disk_space_on_storage_without_zfs_is_a_warning(config: Config) -> None:
+    config = replace(config, cache=replace(config.cache, backend="none"))
+    answers = {
+        **HEALTHY,
+        ("pvesh", "get", "/storage/local-zfs"): done({"type": "lvmthin", "content": "images"}),
+    }
+
+    finding = run(config, answers)["disk space"]
+
+    assert finding.level == "warn" and "not checked" in finding.detail
+
+
+def test_a_zfs_storage_that_is_not_sparse_is_a_warning(config: Config) -> None:
+    answers = {
+        **HEALTHY,
+        ("pvesh", "get", "/storage/local-zfs"): done({
+            "type": "zfspool",
+            "content": "images",
+            "pool": "rpool/data",
+        }),
+    }
+
+    finding = run(config, answers)["template storage"]
+
+    assert finding.level == "warn" and finding.fix.startswith("pvesm set local-zfs --sparse 1")

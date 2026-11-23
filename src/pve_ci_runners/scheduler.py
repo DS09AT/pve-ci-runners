@@ -36,6 +36,7 @@ class Plan:
     create: tuple[int, ...] = ()
     retire: tuple[int, ...] = ()
     unserved: int = 0
+    stuck: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class Round:
     busy: frozenset[str]
     now: float
     idle_timeout: float
+    assign_timeout: float = float("inf")
 
 
 def plan_profile(
@@ -58,12 +60,14 @@ def plan_profile(
     """Plans one profile.
 
     An assigned runner that has not started a job yet covers one queued job of its repository, so a job
-    is never served twice. A runner that has started a job is never retired, whatever the API reports
-    in between. Each warm VM goes to the repository with the fewest VMs, then the oldest waiting job.
+    is never served twice, but only until the assign timeout: a runner that took no job by then is stuck,
+    and is retired even while jobs wait, so another VM can serve them. A runner that has started a job is
+    never retired, whatever the API reports in between. Each warm VM goes to the repository with the
+    fewest VMs, then the oldest waiting job.
     """
     assigned = {v: s for v, s in vms.items() if s.phase == "assigned"}
     idle = {v: s for v, s in assigned.items() if s.runner not in current.busy and s.job_started is None}
-    retire = _retirements(idle, demand, current)
+    retire, stuck = _retirements(idle, demand, current)
     warm = sorted(v for v, s in vms.items() if s.phase == "warm")
     booting = sum(1 for s in vms.values() if s.phase == "booting")
     assign, unmet = _assign(
@@ -83,17 +87,21 @@ def plan_profile(
         create=tuple(sorted(free_slots)[:count]),
         retire=retire,
         unserved=max(0, unmet - booting - count),
+        stuck=stuck,
     )
 
 
-def _retirements(idle: Mapping[int, VmState], demand: Demand, current: Round) -> tuple[int, ...]:
-    return tuple(
-        sorted(
-            v
-            for v, s in idle.items()
-            if current.now - s.since > current.idle_timeout and demand.queued.get(s.repository or "", 0) == 0
-        )
-    )
+def _retirements(
+    idle: Mapping[int, VmState], demand: Demand, current: Round
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Runners unneeded past the idle timeout or stuck past the assign timeout, and the stuck ones."""
+    unneeded = {
+        v
+        for v, s in idle.items()
+        if current.now - s.since > current.idle_timeout and demand.queued.get(s.repository or "", 0) == 0
+    }
+    stuck = {v for v, s in idle.items() if current.now - s.since > current.assign_timeout} - unneeded
+    return tuple(sorted(unneeded | stuck)), tuple(sorted(stuck))
 
 
 def plan_all(
