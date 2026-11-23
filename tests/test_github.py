@@ -262,8 +262,20 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
     }
     api = Api({
         "/repos/o/r/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 9}]},
-        "/repos/o/r/actions/runs?status=in_progress&per_page=50": {"workflow_runs": []},
+        "/repos/o/r/actions/runs?status=pending&per_page=50": {"workflow_runs": [{"id": 9}, {"id": 7}]},
+        "/repos/o/r/actions/runs?status=waiting&per_page=50": {"workflow_runs": []},
+        "/repos/o/r/actions/runs?status=requested&per_page=50": {"workflow_runs": []},
+        "/repos/o/r/actions/runs?status=in_progress&per_page=50": {"workflow_runs": [{"id": 9}]},
         "/repos/o/r/actions/runs/9/jobs?filter=latest&per_page=100": jobs,
+        "/repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100": {
+            "jobs": [
+                {
+                    "status": "queued",
+                    "labels": ["self-hosted", "pve-ci"],
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        },
         "/repos/o/r/actions/runs/9": {
             "path": ".github/workflows/ci.yml",
             "head_branch": "main",
@@ -280,7 +292,9 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
     actions = Actions(api)
 
     queued = actions.queued_jobs("o/r")
-    assert [sorted(j.labels) for j in queued] == [["pve-ci", "self-hosted"]]
+    assert [sorted(j.labels) for j in queued] == [["pve-ci", "self-hosted"]] * 2, (
+        "a job of a pending run is found, and a run listed under two statuses counts once"
+    )
     verified = actions.verify("o/r", 9, "ci-runner-121-abc", running=True)
     assert verified is not None and verified.job == "build" and verified.same_repository
     assert verified.head_sha == "a" * 40

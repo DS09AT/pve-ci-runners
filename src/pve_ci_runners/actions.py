@@ -50,6 +50,12 @@ class Registration:
     encoded_config: str
 
 
+# GitHub reports a run whose jobs still wait for a runner as pending, waiting or requested, not only as
+# queued; a job in such a run that nobody looks for would wait forever and never switch overflow on. A
+# run can change its status between two of these requests, so each run counts once.
+_UNFINISHED_RUNS = ("queued", "pending", "waiting", "requested", "in_progress")
+
+
 class Actions:
     """Repositories, queued jobs and runner registrations of one App installation."""
 
@@ -89,9 +95,10 @@ class Actions:
         return not self._allowed or name.lower() in self._allowed
 
     def queued_jobs(self, repository: str) -> list[QueuedJob]:
-        """Every queued job of the repository's queued or running workflow runs."""
+        """Every queued job of the repository's workflow runs that are not finished yet."""
         jobs: list[QueuedJob] = []
-        for status in ("queued", "in_progress"):
+        seen: set[int] = set()
+        for status in _UNFINISHED_RUNS:
             runs = _obj(
                 self._api.get(
                     f"/repos/{repository}/actions/runs?status={status}&per_page={_RUNS_PAGE}",
@@ -99,7 +106,10 @@ class Actions:
                 )
             )
             for run in _objs(runs.get("workflow_runs")):
-                jobs += self._queued_in(repository, _int(run.get("id")))
+                run_id = _int(run.get("id"))
+                if run_id not in seen:
+                    seen.add(run_id)
+                    jobs += self._queued_in(repository, run_id)
         return jobs
 
     def _queued_in(self, repository: str, run_id: int) -> list[QueuedJob]:
