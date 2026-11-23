@@ -797,3 +797,31 @@ def test_without_any_zfs_dataset_nothing_is_measured(config: Config) -> None:
 def test_a_storage_whose_dataset_is_unknown_is_an_error(answer) -> None:
     with pytest.raises(CommandError, match="local-zfs"):
         ZfsSpace(Script({STORAGE: answer}), storage="local-zfs", cache_dataset=None).available()
+
+
+@pytest.mark.parametrize(("available", "kept"), [(31 * 2**30, True), (2**30, False)])
+def test_a_write_back_finished_by_maintenance_is_what_the_next_lease_clones(
+    config: Config, available: int, kept: bool
+) -> None:
+    golden = "rpool/ci-cache/repos/o__r/ci__build"
+    clone = "rpool/ci-cache/jobs/o__r.ci__build-121-5"
+    script = Script({
+        # The clone becomes the cache, so the listing after the recovery no longer shows it.
+        JOBS: [done(f"{clone}\t1\to__r/ci__build\n"), done("")],
+        ("zfs", "get", "-H", "-o", "value", "origin", clone): done("-\n"),
+        GOLDENS: done(f"{golden}\t-\n"),
+        _snapshot_listing(golden): done(f"{golden}@g6\n"),
+        SPACE: space(available),
+        ("zpool", "list"): done("40%\n"),
+    })
+    cache = zfs_cache(config, script)
+
+    assert "finished the interrupted write-back of the cache o__r/ci__build" in cache.maintain(set())
+    renamed = script.calls.index(["zfs", "rename", clone, golden])
+    evicted = ["zfs", "destroy", "-r", golden] in script.calls[renamed:]
+    assert evicted != kept, "only a dataset below its free reserve evicts the cache it just finished"
+
+    if kept:
+        cache.lease("o__r/ci__build", 122, runner=RUNNER, run_id=2)
+        assert any(c[:2] == ["zfs", "clone"] and f"{golden}@g6" in c for c in script.calls)
+        assert not any(c[:2] == ["zfs", "create"] and golden in c for c in script.calls)

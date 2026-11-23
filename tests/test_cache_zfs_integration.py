@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from pve_ci_runners.cache_zfs import PROMOTING_PROPERTY, RUNNER_PROPERTY, ZfsCache
-from pve_ci_runners.config import Config
+from pve_ci_runners.config import CacheConfig, Config
 from pve_ci_runners.proc import HostCommands
 
 pytestmark = pytest.mark.zfs
@@ -47,6 +47,11 @@ def pool(tmp_path: Path) -> Iterator[str]:
         subprocess.run(["zpool", "destroy", "-f", name], check=False)
 
 
+def _settings(config: Config, dataset: str, volume_size: str, free_reserve_gb: int = 0) -> CacheConfig:
+    """The test pool holds 2 GiB, far below the default free reserve, which would evict every cache."""
+    return replace(config.cache, dataset=dataset, volume_size=volume_size, free_reserve_gb=free_reserve_gb)
+
+
 def _write(device: str, mountpoint: Path, name: str, mebibytes: int = 2) -> None:
     _sh("udevadm", "settle")
     mountpoint.mkdir(exist_ok=True)
@@ -67,7 +72,7 @@ def _files(device: str, mountpoint: Path) -> set[str]:
 def test_a_written_back_cache_is_what_the_next_job_starts_with(
     pool: str, config: Config, tmp_path: Path
 ) -> None:
-    cache = ZfsCache(replace(config.cache, dataset=f"{pool}/ci", volume_size="64M"), HostCommands())
+    cache = ZfsCache(_settings(config, f"{pool}/ci", "64M"), HostCommands())
     first = cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=2)
     assert first is not None
     _write(first.device, tmp_path / "m", "from-main")
@@ -87,7 +92,7 @@ def test_a_written_back_cache_is_what_the_next_job_starts_with(
 
 
 def test_a_stale_lease_does_not_overwrite_a_newer_cache(pool: str, config: Config, tmp_path: Path) -> None:
-    cache = ZfsCache(replace(config.cache, dataset=f"{pool}/ci", volume_size="64M"), HostCommands())
+    cache = ZfsCache(_settings(config, f"{pool}/ci", "64M"), HostCommands())
     early = cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=1)
     late = cache.lease("o__r/ci__build", 122, runner=RUNNER, run_id=2)
     assert early is not None and late is not None
@@ -102,7 +107,7 @@ def test_maintenance_finishes_a_promotion_interrupted_before_the_rename(
     pool: str, config: Config, tmp_path: Path
 ) -> None:
     dataset = f"{pool}/ci"
-    cache = ZfsCache(replace(config.cache, dataset=dataset, volume_size="64M"), HostCommands())
+    cache = ZfsCache(_settings(config, dataset, "64M"), HostCommands())
     lease = cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=1)
     assert lease is not None
     _write(lease.device, tmp_path / "m", "interrupted")
@@ -124,7 +129,7 @@ def test_maintenance_finishes_a_promotion_interrupted_before_the_rename(
 def test_a_trusted_clone_is_promoted_although_the_golden_fills_most_of_a_volume(
     pool: str, config: Config, tmp_path: Path
 ) -> None:
-    cache = ZfsCache(replace(config.cache, dataset=f"{pool}/ci", volume_size="64M"), HostCommands())
+    cache = ZfsCache(_settings(config, f"{pool}/ci", "64M"), HostCommands())
     seed = cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=1)
     assert seed is not None
     _write(seed.device, tmp_path / "m", "seed", 38)
@@ -138,7 +143,22 @@ def test_a_trusted_clone_is_promoted_although_the_golden_fills_most_of_a_volume(
 
 
 def test_a_pool_without_room_for_one_more_volume_gives_no_cache(pool: str, config: Config) -> None:
-    cache = ZfsCache(replace(config.cache, dataset=f"{pool}/ci", volume_size="4G"), HostCommands())
+    cache = ZfsCache(_settings(config, f"{pool}/ci", "4G"), HostCommands())
 
     assert cache.lease("o__r/ci__build", 121, runner=RUNNER, run_id=1) is None
     assert "o__r" not in _sh("zfs", "list", "-H", "-o", "name", "-r", f"{pool}/ci")
+
+
+def test_maintenance_evicts_an_unused_cache_but_never_one_a_job_still_uses(pool: str, config: Config) -> None:
+    cache = ZfsCache(_settings(config, f"{pool}/ci", "64M", free_reserve_gb=1000), HostCommands())
+    busy = cache.lease("o__r/ci__busy", 121, runner=RUNNER, run_id=1)
+    idle = cache.lease("o__r/ci__idle", 122, runner=RUNNER, run_id=2)
+    assert busy is not None and idle is not None
+    cache.drop(idle.lease, 122)
+
+    lines = cache.maintain({busy.lease.clone})
+
+    names = _sh("zfs", "list", "-H", "-o", "name", "-r", f"{pool}/ci/repos").split()
+    assert f"{pool}/ci/repos/o__r/ci__busy" in names, "its snapshot carries a running job's clone"
+    assert f"{pool}/ci/repos/o__r/ci__idle" not in names
+    assert any(line.endswith(f"evicted the cache {pool}/ci/repos/o__r/ci__idle") for line in lines)
