@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.5.3](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.2...v0.5.3) (2026-11-23)
+
+
+### Bug Fixes
+
+* find queued jobs in pending, waiting and requested runs ([57fbafa](https://github.com/DS09AT/pve-ci-runners/commit/57fbafaf139b8ee83cd0affa79c6b116f06e7553))
+
 ## [0.5.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.1...v0.5.2) (2026-11-23)
 
 
