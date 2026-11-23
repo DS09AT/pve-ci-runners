@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.5.1](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.0...v0.5.1) (2026-11-23)
+
+
+### Tests
+
+* keep the ZFS integration caches clear of the free reserve ([28dcdc0](https://github.com/DS09AT/pve-ci-runners/commit/28dcdc0012665b2cfbdc3a4eb5b13edad91df0d7))
+
 ## [0.5.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.4.0...v0.5.0) (2026-11-23)
 
 
