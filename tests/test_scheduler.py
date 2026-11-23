@@ -140,3 +140,28 @@ def test_invariants_over_random_states() -> None:
         assert plan(reordered, list(reversed(free)), queued, busy=busy, limits=limits) == result, (
             "order does not matter"
         )
+
+
+def test_a_stuck_assignment_is_retired_although_jobs_wait_and_the_job_is_served_again() -> None:
+    stuck = VmState(phase="assigned", since=0, profile="p", payload="0" * 16, repository="o/r", runner="r-1")
+    warm = VmState(phase="warm", since=0, profile="p", payload="0" * 16)
+    current = Round(frozenset(), 1000.0, 600, assign_timeout=900)
+
+    result = plan_profile(
+        {1: stuck, 2: warm},
+        [],
+        Demand({"o/r": 1}),
+        ProfileLimits(warm=0, maximum=2, can_start=0),
+        current=current,
+    )
+
+    assert result.retire == (1,) and result.stuck == (1,)
+    assert result.assign == ((2, "o/r"),)
+    early = plan_profile(
+        {1: stuck},
+        [],
+        Demand({"o/r": 1}),
+        ProfileLimits(warm=0, maximum=2, can_start=0),
+        current=Round(frozenset(), 800.0, 600, assign_timeout=900),
+    )
+    assert early.retire == () and early.stuck == ()

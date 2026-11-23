@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 from pve_ci_runners.config import Config, check_secret_file
+from pve_ci_runners.disk import disk_space
 from pve_ci_runners.errors import PveCiError
 from pve_ci_runners.ports import GitHubApp, Hypervisor
 from pve_ci_runners.proc import Commands, output, succeeds
@@ -74,6 +75,7 @@ class Doctor:
             ("template storage", self._template_storage),
             ("snippet storage", self._snippet_storage),
             ("cache dataset", self._dataset),
+            ("disk space", self._disk),
             ("VMIDs", self._vmids),
             ("backup jobs", self._backups),
             ("GitHub App", self._app),
@@ -196,6 +198,13 @@ class Doctor:
                 "template storage",
                 f"{storage} is of type {info.get('type')}; linked clones are fastest on zfspool or lvmthin",
             )
+        if info.get("type") == "zfspool" and info.get("sparse") not in {1, "1"}:
+            return Finding(
+                "warn",
+                "template storage",
+                f"{storage} is not sparse, so every template disk reserves its full template.disk_gb",
+                f"pvesm set {storage} --sparse 1, then pve-ci-runners template build",
+            )
         return Finding("ok", "template storage", f"{storage} ({info.get('type')}) takes linked clones")
 
     def _snippet_storage(self) -> Finding:
@@ -220,6 +229,34 @@ class Doctor:
         return Finding(
             "fail", "cache dataset", f"{cache.dataset} does not exist", f"zfs create -p {cache.dataset}"
         )
+
+    def _disk(self) -> Finding:
+        spaces = disk_space(self._config, self._commands).spaces()
+        if not spaces:
+            return Finding(
+                "warn",
+                "disk space",
+                f"neither {self._config.template.storage} nor the cache is on ZFS; free space is not "
+                "checked before a VM starts",
+            )
+        tightest = min(spaces, key=lambda s: s.available)
+        reserve = self._config.capacity.disk_reserve_gb
+        # One reserve per slot and one for a template build, which runs next to the runners.
+        needed = (len(self._config.slots) + 1) * reserve
+        quota = f", quota {tightest.quota / 2**30:.1f} GiB" if tightest.quota else ""
+        detail = f"{tightest.dataset} has {tightest.available / 2**30:.1f} GiB available{quota}"
+        fix = f"free space below {tightest.dataset}, raise its quota or lower capacity.disk_reserve_gb"
+        if tightest.available < reserve * 2**30:
+            return Finding("fail", "disk space", f"{detail}, less than one VM's {reserve} GiB reserve", fix)
+        if tightest.available < needed * 2**30:
+            return Finding(
+                "warn",
+                "disk space",
+                f"{detail}, less than {len(self._config.slots)} slots and a template build at {reserve} GiB "
+                f"each ({needed} GiB); VMs beyond that wait",
+                fix,
+            )
+        return Finding("ok", "disk space", f"{detail}, enough for every slot and a template build")
 
     def _vmids(self) -> Finding:
         prefix = self._config.daemon.name_prefix

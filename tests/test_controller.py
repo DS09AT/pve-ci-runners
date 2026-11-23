@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from concurrent.futures import wait
 from dataclasses import replace
 from pathlib import Path
 
@@ -46,8 +47,11 @@ def controller(
     config: Config, host: FakeHost, github: FakeGitHub, cache: FakeCache, clock: Clock
 ) -> Controller:
     assert config.overflow is not None
-    ctl = Controller(config, host, github, cache, overflow=Overflow(config.overflow, github), clock=clock)
+    ctl = Controller(
+        config, host, github, cache, disk=host, overflow=Overflow(config.overflow, github), clock=clock
+    )
     ctl._lifecycle._executor = Background(inline=True)
+    ctl._lifecycle._checker = Background(inline=True)
     return ctl
 
 
@@ -852,7 +856,7 @@ def test_without_overflow_no_variable_is_written(setup) -> None:
     host.machines[9201].description = "interrupted build"
     github.queue("example-org/app", count=2)
 
-    Controller(config, host, github, cache, overflow=None, clock=clock).cycle()
+    Controller(config, host, github, cache, disk=host, overflow=None, clock=clock).cycle()
 
     assert github.variables == {}
 
@@ -986,15 +990,379 @@ def test_a_tidy_started_for_one_state_never_writes_back_another(setup) -> None:
     assert cache.written == [] and cache.dropped == ["example-org/forged"], "GitHub is asked again"
 
 
-def test_the_tidy_runs_on_a_thread_of_its_own(setup) -> None:
+def test_the_guest_check_and_the_tidy_run_on_threads_of_their_own(setup) -> None:
     config, host, github, cache, clock = setup
     ctl = started_job(setup)
-    ctl._lifecycle = Lifecycle(config, host, github, cache, clock=clock)
+    lifecycle = ctl._lifecycle = Lifecycle(config, host, github, cache, clock=clock)
     host.machines[121].done = True
     github.conclusions[42] = "success"
 
+    for _ in range(8):
+        ctl.cycle()
+        if cache.written:
+            break
+        wait([f for _, f in lifecycle._checks.values()] + [f for _, f in lifecycle._tidying.values()])
+
+    assert cache.written == [KEY] and "destroy 121" in host.events
+
+
+GIB = 2**30
+HOSTED = '"ubuntu-latest"'
+
+
+def overflow_value(github: FakeGitHub) -> str | None:
+    return github.variables.get(("example-org/app", "CI_RUNS_ON"))
+
+
+def test_no_vm_starts_without_its_disk_reserve_and_the_job_overflows_at_once(setup) -> None:
+    config, host, github, _, _ = setup
+    host.disk_bytes = config.capacity.disk_reserve_bytes - 1
+    github.queue("example-org/app")
+
+    controller(*setup).cycle()
+
+    assert set(host.machines) == {9201}
+    assert overflow_value(github) == HOSTED, "one job, waiting briefly, overflows because no VM can start"
+
+
+def test_one_job_with_disk_room_waits_for_its_vm_instead(setup) -> None:
+    _, host, github, _, _ = setup
+    github.queue("example-org/app")
+
+    controller(*setup).cycle()
+
+    assert 121 in host.machines and overflow_value(github) != HOSTED
+
+
+def test_a_full_dataset_heals_by_eviction_and_the_idle_vm_takes_the_job(setup, monkeypatch) -> None:
+    _, host, github, cache, _ = setup
+    ctl = started_job(setup)
     ctl.cycle()
-    ctl._lifecycle._executor.shutdown(wait=True)
+    assert state(host, 122).phase == "warm"
+    host.disk_bytes = 40 * 2**20
+    evictions: list[set[str]] = []
+
+    def evict(in_use: set[str]) -> list[str]:
+        evictions.append(in_use)
+        host.disk_bytes = 40 * GIB
+        return ["evicted the cache rpool/ci-cache/repos/a/old"]
+
+    monkeypatch.setattr(cache, "maintain", evict)
+    github.queue("example-org/app")
+
     ctl.cycle()
 
+    assert evictions and state(host, 121).cache is not None
+    assert evictions[0] == {state(host, 121).cache.clone}, "the running job's clone is never evicted"
+    assert state(host, 122).phase == "assigned" and "destroy 122" not in host.events
+
+
+def test_without_cache_to_evict_idle_vms_go_and_starts_resume_once_space_is_back(setup, caplog) -> None:
+    config, host, github, _, clock = setup
+    ctl = started_job(setup)
+    ctl.cycle()
+    runner = state(host, 121).runner
+    host.disk_bytes = config.capacity.disk_reserve_bytes
+    github.queue("example-org/app")
+
+    ctl.cycle()
+
+    assert "destroy 122" in host.events and state(host, 121).runner == runner, "only the idle VM goes"
+    assert "VM 122 is retired: the disk lacks the write reserve" in caplog.text
+    assert overflow_value(github) == HOSTED
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+    assert 122 not in host.machines, "admission is retried, and refused, every cycle"
+
+    host.disk_bytes = 40 * GIB
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+    assert state(host, 122).phase == "booting"
+
+
+def test_unknown_disk_space_starts_and_assigns_nothing_and_retires_nothing(setup, caplog) -> None:
+    _, host, github, _, _ = setup
+    ctl = warm_vm(setup)
+    host.disk_error = True
+    github.queue("example-org/app")
+
+    ctl.cycle()
+
+    assert state(host, 121).phase == "warm" and 122 not in host.machines
+    assert "destroy 121" not in host.events
+    assert "free disk space unknown" in caplog.text
+    assert overflow_value(github) == HOSTED
+
+
+def test_vms_start_only_as_far_as_the_disk_holds_their_reserves(setup, caplog) -> None:
+    config, host, github, cache, clock = setup
+    data = config_data(
+        daemon={"state_dir": str(config.daemon.state_dir), "log_dir": str(config.daemon.log_dir)}
+    )
+    data["profile"][0]["max"] = 1
+    data["profile"].append({
+        **data["profile"][0],
+        "name": "large",
+        "match": "pve-large",
+        "labels": ["self-hosted", "pve-large"],
+    })
+    config = parse(data)
+    host.disk_bytes = config.capacity.disk_reserve_bytes
+
+    controller(config, host, github, cache, clock).cycle()
+
+    assert [e for e in host.events if e.startswith("clone")] == ["clone 121"]
+    assert "not starting VM 122: the disk keeps the write reserve of every VM" in caplog.text
+
+
+def test_a_vm_whose_guest_keeps_failing_is_retired_and_its_slot_reused(setup, caplog) -> None:
+    config, host, github, cache, clock = setup
+    ctl = started_job(setup)
+    runner = state(host, 121).runner
+    host.machines[121].silent = True
+    for _ in range(config.daemon.unhealthy_checks - 1):
+        clock.now += config.daemon.poll_seconds
+        ctl.cycle()
+        assert state(host, 121).runner == runner
+
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+
+    assert "VM 121 is retired: its guest failed 3 checks in a row" in caplog.text
+    assert cache.written == [] and cache.dropped == [KEY]
+    assert runner in github.removed
+    github.queue("example-org/app")
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+    assert state(host, 121).phase == "booting", "the freed slot takes a new VM"
+    assert state(host, 122).phase == "assigned"
+
+
+def test_one_answered_check_resets_the_count_of_failed_ones(setup) -> None:
+    _, host, _, _, _ = setup
+    ctl = started_job(setup)
+    for silent in (True, True, False, True, True):
+        host.machines[121].silent = silent
+        ctl.cycle()
+
+    assert state(host, 121).phase == "assigned"
+
+
+def test_a_warm_vm_whose_guest_fails_is_retired(setup) -> None:
+    config, host, _, _, _ = setup
+    ctl = warm_vm(setup)
+    host.machines[121].silent = True
+
+    for _ in range(config.daemon.unhealthy_checks):
+        ctl.cycle()
+
+    assert "destroy 121" in host.events
+
+
+def checks_of(background: Background, vmid: int) -> list:
+    return [work for _, work in background.pending if work.args == (vmid,)]
+
+
+def test_a_guest_check_runs_in_the_background_and_the_cycle_never_waits_for_it(setup) -> None:
+    _, host, github, cache, _ = setup
+    ctl = started_job(setup)
+    background = Background()
+    ctl._lifecycle._checker = background
+    host.machines[121].done = True
+
+    ctl.cycle()
+    ctl.cycle()
+    assert state(host, 121).phase == "assigned" and len(checks_of(background, 121)) == 1, "one at a time"
+
+    github.conclusions[42] = "success"
+    background.run()
+    ctl.cycle()
     assert 121 not in host.machines and cache.written == [KEY]
+
+
+def test_a_check_started_for_an_earlier_state_is_not_used(setup) -> None:
+    _, host, _, _, _ = setup
+    ctl = started_job(setup)
+    background = Background()
+    ctl._lifecycle._checker = background
+    ctl.cycle()
+    current = state(host, 121)
+    host.machines[121].description = current.evolve(done_at=5).encode()
+    ctl.cycle()
+    assert len(checks_of(background, 121)) == 1, "the same runner keeps its check"
+    host.machines[121].description = current.evolve(since=current.since + 1).encode()
+
+    ctl.cycle()
+
+    assert len(checks_of(background, 121)) == 2, "a new check is started for another assignment"
+
+
+def test_unmeasured_disk_space_holds_nothing_back(setup) -> None:
+    _, host, _, _, _ = setup
+    host.disk_bytes = None
+
+    controller(*setup).cycle()
+
+    assert 121 in host.machines
+
+
+def test_an_idle_vm_that_cannot_be_retired_for_disk_room_still_takes_no_job(setup) -> None:
+    config, host, github, _, _ = setup
+    ctl = started_job(setup)
+    ctl.cycle()
+    host.undestroyable.add(122)
+    host.disk_bytes = config.capacity.disk_reserve_bytes
+    github.queue("example-org/app")
+
+    ctl.cycle()
+
+    assert state(host, 122).phase == "warm"
+    assert overflow_value(github) == HOSTED
+
+
+def test_a_stopped_warm_vm_is_not_asked_by_its_guest(setup) -> None:
+    _, host, _, _, _ = setup
+    ctl = warm_vm(setup)
+    host.machines[121].running = False
+    asked = host.scripts.count((121, "finished"))
+
+    ctl.cycle()
+
+    assert host.scripts.count((121, "finished")) == asked and state(host, 121).phase == "warm"
+
+
+def test_a_running_template_build_keeps_its_disk_reserve(setup) -> None:
+    config, host, _, _, _ = setup
+    reserve(config.daemon.state_dir, config.template.memory_mb)
+    host.disk_bytes = config.capacity.disk_reserve_bytes
+
+    controller(*setup).cycle()
+
+    assert 121 not in host.machines
+
+
+def test_a_runner_that_takes_no_job_is_replaced_while_its_repository_still_waits(setup, caplog) -> None:
+    config, host, github, cache, clock = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app")
+    ctl.cycle()
+    stuck = state(host, 121).runner
+    github.queue("example-org/app")
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+    assert state(host, 122).phase == "warm", "the assigned runner covers the waiting job"
+
+    clock.now += config.daemon.assign_timeout_seconds - config.daemon.poll_seconds
+    ctl.cycle()
+    assert state(host, 121).runner == stuck, "inside the assign timeout the runner keeps its job"
+    clock.now += 1
+    ctl.cycle()
+
+    assert "VM 121 is retired: its runner took no job within the assign timeout" in caplog.text
+    assert stuck in github.removed and cache.dropped == [] and cache.written == []
+    assert state(host, 122).phase == "assigned", "a fresh VM takes the waiting job"
+
+
+def test_a_runner_github_reports_busy_is_never_retired_as_stuck(setup) -> None:
+    config, host, github, _, clock = setup
+    ctl = warm_vm(setup)
+    github.queue("example-org/app")
+    ctl.cycle()
+    github.busy.add(state(host, 121).runner)
+    github.queue("example-org/app")
+
+    clock.now += config.daemon.assign_timeout_seconds + 1
+    ctl.cycle()
+
+    assert "destroy 121" not in host.events
+
+
+def test_a_short_disk_evicts_in_the_same_cycle_and_the_job_gets_its_vm(setup, monkeypatch) -> None:
+    _, host, github, cache, _ = setup
+    host.disk_bytes = 0
+
+    def evict(_in_use: set[str]) -> list[str]:
+        host.disk_bytes = 40 * GIB
+        return ["evicted the cache rpool/ci-cache/repos/a/old"]
+
+    monkeypatch.setattr(cache, "maintain", evict)
+    github.queue("example-org/app")
+
+    controller(*setup).cycle()
+
+    assert 121 in host.machines
+    assert overflow_value(github) != HOSTED
+
+
+def test_a_short_disk_without_caches_to_evict_overflows_and_recovers_by_itself(setup, monkeypatch) -> None:
+    config, host, github, cache, clock = setup
+    host.disk_bytes = 0
+    evictable = [False]
+    calls: list[int] = []
+
+    def evict(_in_use: set[str]) -> list[str]:
+        calls.append(1)
+        if evictable[0]:
+            host.disk_bytes = 40 * GIB
+        return []
+
+    monkeypatch.setattr(cache, "maintain", evict)
+    github.queue("example-org/app")
+    ctl = controller(*setup)
+
+    ctl.cycle()
+    assert set(host.machines) == {9201} and overflow_value(github) == HOSTED
+    tried = len(calls)
+
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+    assert len(calls) == tried + 1 and 121 not in host.machines, "eviction is retried every cycle"
+
+    evictable[0] = True
+    for _ in range(8):
+        clock.now += config.daemon.poll_seconds
+        ctl.cycle()
+    assert state(host, 121).phase == "assigned"
+    assert overflow_value(github) != HOSTED, "overflow switches off once VMs start again"
+
+
+def test_a_finished_runner_whose_tidy_takes_minutes_keeps_its_write_back(setup) -> None:
+    config, host, github, cache, clock = setup
+    ctl = started_job(setup)
+    checker = ctl._lifecycle._checker = Background()
+    tidy = ctl._lifecycle._executor = Background()
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+    tidy_seconds = 300
+
+    for _ in range(tidy_seconds // config.daemon.poll_seconds):
+        ctl.cycle()
+        checker.run()
+        clock.now += config.daemon.poll_seconds
+    assert 121 in host.machines and len(tidy.pending) == 1, "one tidy, and the VM waits for it"
+
+    tidy.run()
+    ctl.cycle()
+
+    assert 121 not in host.machines and cache.written == [KEY] and cache.dropped == []
+
+
+def test_no_disk_room_starts_nothing_and_counts_each_job_once(setup, monkeypatch, caplog) -> None:
+    _, host, github, _, _ = setup
+    host.disk_error = True
+    github.queue("example-org/app")
+    ctl = controller(*setup)
+    assert ctl._overflow is not None
+    reported: list[int] = []
+    update = ctl._overflow.update
+
+    def spy(**kwargs):
+        reported.append(kwargs["unserved"])
+        return update(**kwargs)
+
+    monkeypatch.setattr(ctl._overflow, "update", spy)
+
+    ctl.cycle()
+
+    assert reported == [1]
+    assert "not starting VM" not in caplog.text and set(host.machines) == {9201}

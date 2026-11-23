@@ -24,7 +24,7 @@ from pve_ci_runners.firewall import deny_set, probe_sample, render
 from pve_ci_runners.guest import Guest, script, with_inputs
 from pve_ci_runners.images import fetch_image
 from pve_ci_runners.lifecycle import IsolationError
-from pve_ci_runners.ports import TemplateHypervisor
+from pve_ci_runners.ports import DiskSpace, TemplateHypervisor
 from pve_ci_runners.pve import TAG
 from pve_ci_runners.templates import TemplateMarker, build_snippet, build_vm_name, current_template
 
@@ -43,11 +43,12 @@ log = logging.getLogger("pve_ci_runners")
 class TemplateBuilder:
     """Builds the next template of the configured pair."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - two ports and the clock, sleep, download and file system a test replaces
         self,
         config: Config,
         host: TemplateHypervisor,
         *,
+        disk: DiskSpace,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         fetch: Callable[[str, str, Path], Path] = fetch_image,
@@ -55,6 +56,7 @@ class TemplateBuilder:
     ) -> None:
         self._config = config
         self._host = host
+        self._disk = disk
         self._clock = clock
         self._sleep = sleep
         self._fetch = fetch
@@ -84,14 +86,14 @@ class TemplateBuilder:
         """Holds memory for the build VM, and drains the runners until the host has that much to spare.
 
         The reservation keeps the controller from starting runner VMs into the memory the build needs;
-        the host's other guests never give way to a build.
+        the host's other guests never give way to a build. Disk space is waited for the same way.
         """
         state_dir = self._config.daemon.state_dir
         reserve(state_dir, self._config.template.memory_mb)
         drained = False
         try:
             deadline = self._clock() + _ROOM_TIMEOUT
-            while not self._fits(vmid):
+            while not (self._fits(vmid) and self._disk_fits()):
                 if not drained and not draining(state_dir):
                     log.info("draining the runners to make room for the build VM")
                     drain(state_dir)
@@ -119,6 +121,19 @@ class TemplateBuilder:
             )
             >= 1
         )
+
+    def _disk_fits(self) -> bool:
+        """Whether the disk keeps a write reserve for the build VM and for every runner VM.
+
+        The disk grows to `template.disk_gb` only as far as the build writes, so the reserve is what
+        decides, not that size.
+        """
+        available = self._disk.available()
+        if available is None:
+            return True
+        slots = {s.vmid for s in self._config.slots}
+        runners = sum(1 for vmid in self._host.vms() if vmid in slots)
+        return available >= (runners + 1) * self._config.capacity.disk_reserve_bytes
 
     def _build_vm(self, vmid: int, image: Path, scripts: list[str]) -> str:
         self._create(vmid, image)
@@ -195,7 +210,7 @@ class TemplateBuilder:
         self._host.resize(vmid, "scsi0", f"{template.disk_gb}G")
         # Checked again: runner VMs may have started while the image was imported.
         with memory_lock(self._config.daemon.state_dir):
-            if not self._fits(vmid):
+            if not (self._fits(vmid) and self._disk_fits()):
                 raise PveCiError(_NO_ROOM)
             self._host.start(vmid)
         deadline = self._clock() + _AGENT_TIMEOUT

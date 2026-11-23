@@ -10,6 +10,7 @@ app_key_file = "/etc/pve-ci-runners/app.pem"  # the App's private key, mode 0600
 [capacity]
 memory_mb = 20480        # all runner VMs together
 host_reserve_mb = 4096   # never start a VM if the host would keep less than this for its other guests
+# disk_reserve_gb = 10   # free disk space kept per runner or build VM before another one starts
 
 [network]
 bridge = "vmbr1"         # a NAT bridge that only runner VMs use
@@ -40,10 +41,12 @@ qm_options = { cpuunits = 100 }        # lower CPU priority than the host's othe
 [cache]
 backend = "zfs"                        # or "none"
 dataset = "rpool/ci-cache"
+# free_reserve_gb = 30                 # evict caches below this; default: (slots + 1) * disk_reserve_gb
 
 [template]
 vmids = [9201, 9202]                   # two template VMIDs that take turns
-storage = "local-zfs"                  # where templates and their linked clones live
+storage = "local-zfs"                  # where templates and their linked clones live; sparse on ZFS
+# disk_gb = 40                         # the template disk's size; thin, so only what is written counts
 address = "192.168.100.20"             # the build VM's address on the bridge
 # A dated cloud image and the SHA-256 published next to it; the build refuses any other bytes.
 image_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260101/ubuntu-24.04-server-cloudimg-amd64.img"

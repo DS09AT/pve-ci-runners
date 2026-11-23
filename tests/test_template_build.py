@@ -35,6 +35,7 @@ def builder(config: Config, host: FakeHost, now: float = 5000.0, root: Path = Pa
     return TemplateBuilder(
         config,
         host,
+        disk=host,
         clock=lambda: now,
         sleep=lambda _: None,
         fetch=lambda *_: Path("/images/noble.img"),
@@ -119,7 +120,7 @@ def test_a_build_waits_for_the_guest_agent_until_its_timeout(
 
     monkeypatch.setattr(host, "agent_ready", agent_ready)
     build = TemplateBuilder(
-        config, host, clock=lambda: now[0], sleep=sleep, fetch=lambda *_: Path("/images/noble.img")
+        config, host, disk=host, clock=lambda: now[0], sleep=sleep, fetch=lambda *_: Path("/images/noble.img")
     )
 
     if built:
@@ -326,6 +327,7 @@ def test_a_build_drains_the_runners_for_room_and_never_squeezes_other_guests(set
     TemplateBuilder(
         config,
         host,
+        disk=host,
         clock=lambda: 1.0,
         sleep=controller_retires_the_idle_runners,
         fetch=lambda *_: Path("/i"),
@@ -346,7 +348,7 @@ def test_a_build_without_room_gives_up_without_starting_anything(setup, tmp_path
 
     with pytest.raises(PveCiError, match="no room"):
         TemplateBuilder(
-            config, host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
+            config, host, disk=host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
         ).build()
 
     assert not any(e.startswith("create") for e in host.events)
@@ -357,7 +359,9 @@ def test_the_build_vm_is_not_counted_twice(setup) -> None:
     config, host = setup
     host.total_mb = host.other_guests_mb + config.capacity.host_reserve_mb + config.template.memory_mb
 
-    TemplateBuilder(config, host, clock=lambda: 1.0, sleep=_no_wait, fetch=lambda *_: Path("/i")).build()
+    TemplateBuilder(
+        config, host, disk=host, clock=lambda: 1.0, sleep=_no_wait, fetch=lambda *_: Path("/i")
+    ).build()
 
     assert "start 9201" in host.events
 
@@ -374,7 +378,7 @@ def test_a_vm_on_the_other_template_vmid_counts_during_a_build(setup, name: str,
 
     with pytest.raises(PveCiError, match="no room"):
         TemplateBuilder(
-            config, host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
+            config, host, disk=host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
         ).build()
 
     assert not any(e.startswith("create") for e in host.events)
@@ -393,7 +397,9 @@ def test_an_operators_drain_outlasts_the_build(setup, tmp_path: Path) -> None:
         host.machines.pop(121, None)
         host.machines.pop(122, None)
 
-    TemplateBuilder(config, host, clock=lambda: 1.0, sleep=freed, fetch=lambda *_: Path("/i")).build()
+    TemplateBuilder(
+        config, host, disk=host, clock=lambda: 1.0, sleep=freed, fetch=lambda *_: Path("/i")
+    ).build()
 
     assert draining(config.daemon.state_dir)
 
@@ -449,3 +455,67 @@ def test_a_build_vm_that_cannot_keep_its_out_of_memory_priority_is_removed(setup
 
     assert "destroy 9201" in host.events
     assert not [s for s in host.scripts if s[1] != "probe"], "no provisioning step runs unprotected"
+
+
+GIB = 2**30
+
+
+def test_a_build_waits_for_disk_room_for_itself_and_every_runner(setup) -> None:
+    config, host = setup
+    for vmid in (121, 122):
+        host.machines[vmid] = FakeVm(name=f"ci-runner-{vmid}", running=True, memory_mb=1024, tags={TAG})
+    host.disk_bytes = 3 * GIB * config.capacity.disk_reserve_gb - 1
+    seen: list[bool] = []
+
+    def runners_finish(_: float) -> None:
+        seen.append(draining(config.daemon.state_dir))
+        host.machines.pop(121, None)
+
+    TemplateBuilder(
+        config, host, disk=host, clock=lambda: 1.0, sleep=runners_finish, fetch=lambda *_: Path("/i")
+    ).build()
+
+    assert seen == [True], "the runners drain until the disk holds a reserve for the build"
+    assert host.events[0] == "create 9201"
+
+
+def test_a_build_without_disk_room_gives_up_without_creating_anything(setup) -> None:
+    config, host = setup
+    host.disk_bytes = config.capacity.disk_reserve_bytes - 1
+    now = [0.0]
+
+    def time_passes(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(PveCiError, match="no room"):
+        TemplateBuilder(
+            config, host, disk=host, clock=lambda: now[0], sleep=time_passes, fetch=lambda *_: Path("/i")
+        ).build()
+
+    assert host.events == []
+
+
+def test_disk_filled_during_the_import_stops_the_build_before_its_vm_boots(setup, monkeypatch) -> None:
+    config, host = setup
+    create = host.create
+
+    def import_fills_the_disk(vmid: int, options) -> None:
+        create(vmid, options)
+        host.disk_bytes = 0
+
+    monkeypatch.setattr(host, "create", import_fills_the_disk)
+
+    with pytest.raises(PveCiError, match="no room"):
+        builder(config, host).build()
+
+    assert "start 9201" not in host.events and 9201 not in host.machines
+
+
+def test_a_large_template_disk_builds_on_unmeasured_storage(setup) -> None:
+    config, host = setup
+    config = replace(config, template=replace(config.template, disk_gb=80))
+    host.disk_bytes = None
+
+    builder(config, host).build()
+
+    assert "resize 9201 scsi0 80G" in host.events

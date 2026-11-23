@@ -51,6 +51,9 @@ class Lifecycle:
         # nor queued jobs, and one worker per slot lets every finished VM tidy at the same time.
         self._executor: Executor = ThreadPoolExecutor(len(config.slots), thread_name_prefix="tidy")
         self._tidying: dict[int, tuple[VmState, Future[None]]] = {}
+        # Checks get workers of their own, so a guest that hangs until its timeout delays no other VM.
+        self._checker: Executor = ThreadPoolExecutor(len(config.slots), thread_name_prefix="check")
+        self._checks: dict[int, tuple[tuple[str, int, str | None], Future[bool]]] = {}
 
     def name(self, vmid: int) -> str:
         """The VM name of a slot."""
@@ -202,8 +205,25 @@ class Lifecycle:
         return True
 
     def finished(self, vmid: int) -> bool:
-        """Whether the VM's runner has exited."""
+        """Whether the VM's runner has exited, asked and awaited now."""
         return self._guest.finished(vmid)
+
+    def poll_finished(self, vmid: int, state: VmState) -> bool | None:
+        """Whether the VM's runner has exited, or None while the check runs in the background.
+
+        A check counts only for the phase and runner it was started for, so no answer reaches a later VM in
+        the slot. An exit is final: it is kept, so a finished runner whose cache is still tidied never
+        looks unfinished again. Any other answer is asked anew; a failed check raises its error.
+        """
+        key = (state.phase, state.since, state.runner)
+        check = self._checks.get(vmid)
+        if check is None or check[0] != key:
+            check = self._checks[vmid] = (key, self._checker.submit(self._guest.finished, vmid))
+        if not check[1].done():
+            return None
+        if check[1].exception() is not None or not check[1].result():
+            del self._checks[vmid]
+        return check[1].result()
 
     def outlived_job(self, vmid: int, state: VmState) -> bool:
         """Whether GitHub recorded the end of the job a grace period ago, although the guest never did.
