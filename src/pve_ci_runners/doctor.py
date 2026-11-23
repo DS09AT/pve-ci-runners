@@ -68,6 +68,7 @@ class Doctor:
             ("app key", self._key),
             ("datacenter firewall", self._firewall),
             ("bridge", self._bridge),
+            ("bridge address", self._bridge_address),
             ("forwarding", self._forwarding),
             ("outbound NAT", self._nat),
             ("memory reserve", self._reserve),
@@ -121,6 +122,23 @@ class Doctor:
             "bridge",
             f"{network.bridge} does not carry {network.gateway}/{network.prefix}",
             f"add the address to {network.bridge} in /etc/network/interfaces, then ifreload -a",
+        )
+
+    def _bridge_address(self) -> Finding:
+        # A bridge without an address of its own follows its ports, so the gateway moves whenever a
+        # runner VM starts or stops and the other runners lose all egress until their ARP entry expires.
+        bridge = self._config.network.bridge
+        kind = output(
+            self._commands, ["cat", f"/sys/class/net/{bridge}/addr_assign_type"], timeout=30
+        ).strip()
+        if kind in {"0", "3"}:
+            return Finding("ok", "bridge address", f"{bridge} keeps a fixed hardware address")
+        return Finding(
+            "fail",
+            "bridge address",
+            f"{bridge} takes its hardware address from its ports, so it moves when a VM starts or stops",
+            f"ip link set dev {bridge} address $(cat /sys/class/net/{bridge}/address), and add that address "
+            f"as hwaddress to the {bridge} stanza in /etc/network/interfaces",
         )
 
     def _forwarding(self) -> Finding:

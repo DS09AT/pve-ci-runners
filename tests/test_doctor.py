@@ -15,6 +15,7 @@ HEALTHY = {
     ("ip", "-j", "addr", "show", "dev", "vmbr1"): done([
         {"addr_info": [{"local": "192.168.100.1", "prefixlen": 24}]}
     ]),
+    ("cat", "/sys/class/net/vmbr1/addr_assign_type"): done("3\n"),
     ("sysctl", "-n", "net.ipv4.ip_forward"): done("1\n"),
     ("nft", "list", "ruleset"): done('\t\tip saddr 192.168.100.0/24 oifname "eno1" masquerade\n'),
     ("pvesh", "get", "/storage/local-zfs"): done({
@@ -87,6 +88,8 @@ def test_a_ready_node_passes_every_check(config: Config) -> None:
     [
         (("cat", "/etc/pve/firewall/cluster.fw"), done("[OPTIONS]\nenable: 0\n"), "datacenter firewall"),
         (("ip", "-j", "addr", "show", "dev", "vmbr1"), done([]), "bridge"),
+        (("cat", "/sys/class/net/vmbr1/addr_assign_type"), done("1\n"), "bridge address"),
+        (("cat", "/sys/class/net/vmbr1/addr_assign_type"), done("", 1), "bridge address"),
         (("sysctl", "-n", "net.ipv4.ip_forward"), done("0\n"), "forwarding"),
         (("pvesh", "get", "/storage/local"), done({"type": "dir", "content": "iso"}), "snippet storage"),
         (
