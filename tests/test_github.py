@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from pve_ci_runners.actions import Actions
+from pve_ci_runners.actions import Actions, Runs
 from pve_ci_runners.errors import CommandError, GitHubError
 from pve_ci_runners.github import AppKeySigner, GitHubClient, Response, UrllibTransport
 from pve_ci_runners.proc import Completed
@@ -175,8 +175,10 @@ class Api:
         self.fail = fail or {}
         self.writes: list[tuple[str, str, object]] = []
         self.deleted: list[str] = []
+        self.conditional: dict[str, bool] = {}
 
     def get(self, path, *, conditional=False):
+        self.conditional[path] = conditional
         if path in self.fail:
             raise self.fail[path]
         return self.gets[path]
@@ -262,19 +264,22 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
     }
     api = Api({
         "/repos/o/r/actions/runs?status=queued&per_page=50": {"workflow_runs": [{"id": 9}]},
-        "/repos/o/r/actions/runs?status=pending&per_page=50": {"workflow_runs": [{"id": 9}, {"id": 7}]},
+        "/repos/o/r/actions/runs?status=pending&per_page=50": {
+            "workflow_runs": [{"id": 9}, {"id": 7, "run_attempt": 1}]
+        },
         "/repos/o/r/actions/runs?status=waiting&per_page=50": {"workflow_runs": []},
         "/repos/o/r/actions/runs?status=requested&per_page=50": {"workflow_runs": []},
         "/repos/o/r/actions/runs?status=in_progress&per_page=50": {"workflow_runs": [{"id": 9}]},
         "/repos/o/r/actions/runs/9/jobs?filter=latest&per_page=100": jobs,
         "/repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100": {
+            "total_count": 1,
             "jobs": [
                 {
                     "status": "queued",
                     "labels": ["self-hosted", "pve-ci"],
                     "created_at": "2026-01-01T00:00:00Z",
                 }
-            ]
+            ],
         },
         "/repos/o/r/actions/runs/9": {
             "path": ".github/workflows/ci.yml",
@@ -295,6 +300,7 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
     assert [sorted(j.labels) for j in queued] == [["pve-ci", "self-hosted"]] * 2, (
         "a job of a pending run is found, and a run listed under two statuses counts once"
     )
+    assert [(j.run_id, j.run_unstarted) for j in queued] == [(9, False), (7, True)]
     verified = actions.verify("o/r", 9, "ci-runner-121-abc", running=True)
     assert verified is not None and verified.job == "build" and verified.same_repository
     assert verified.head_sha == "a" * 40
@@ -358,3 +364,142 @@ def test_an_unknown_runner_lookup_deletes_nothing() -> None:
     failing = Api({}, {LOOKUP: GitHubError("forbidden", 403)})
     with pytest.raises(GitHubError, match="forbidden"):
         Actions(failing).remove_runner("o/r", "ci-runner-121-abc")
+
+
+def runs_api(jobs: dict[str, object], *, attempt: object = 1) -> Api:
+    gets: dict[str, object] = {
+        f"/repos/o/r/actions/runs?status={s}&per_page=50": {"workflow_runs": []}
+        for s in ("pending", "waiting", "requested", "in_progress")
+    }
+    gets["/repos/o/r/actions/runs?status=queued&per_page=50"] = {
+        "workflow_runs": [{"id": 3, "run_attempt": attempt}]
+    }
+    gets["/repos/o/r/actions/runs/3/jobs?filter=latest&per_page=100"] = jobs
+    gets["/repos/o/r/actions/runs/3"] = {
+        "status": "completed",
+        "conclusion": "cancelled",
+        "workflow_id": 11,
+        "head_branch": "release/1.x",
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    gets[NEWER] = {"workflow_runs": [{"id": 3, "created_at": "2026-01-01T00:00:00Z"}]}
+    return Api(gets)
+
+
+NEWER = "/repos/o/r/actions/workflows/11/runs?branch=release%2F1.x&per_page=5"
+JOBS = "/repos/o/r/actions/runs/3/jobs?filter=latest&per_page=100"
+
+
+QUEUED = {"status": "queued", "labels": [], "created_at": "2026-01-01T00:00:00Z"}
+
+
+@pytest.mark.parametrize(
+    ("other", "unstarted"),
+    [
+        ({"status": "completed", "conclusion": "skipped"}, True),
+        ({"status": "waiting"}, True),
+        ({"status": "completed", "conclusion": "success"}, False),
+        ({"status": "in_progress", "runner_name": "ci-runner-121-abc"}, False),
+        ({"status": "waiting", "runner_name": "ci-runner-121-abc"}, False),
+    ],
+)
+def test_a_run_counts_as_unstarted_only_while_no_job_did_work(other: dict, unstarted: bool) -> None:
+    api = runs_api({"total_count": 2, "jobs": [QUEUED, other]})
+
+    assert Actions(api).queued_jobs("o/r")[0].run_unstarted is unstarted
+    assert Runs(api).cancel_unstarted("o/r", 3) is unstarted
+    assert api.conditional[JOBS] is False, "the check right before the cancellation is never served stale"
+    assert api.writes == ([("POST", "/repos/o/r/actions/runs/3/cancel", {})] if unstarted else [])
+
+
+@pytest.mark.parametrize(("total", "attempt"), [(3, 1), (None, 1), (True, 1), (2, 2), (2, None)], ids=str)
+def test_a_run_with_unlisted_jobs_or_a_later_attempt_is_never_unstarted(
+    total: object, attempt: object
+) -> None:
+    api = runs_api({"total_count": total, "jobs": [QUEUED, QUEUED]}, attempt=attempt)
+
+    assert Actions(api).queued_jobs("o/r")[0].run_unstarted is False
+    if attempt == 1:
+        assert Runs(api).cancel_unstarted("o/r", 3) is False and api.writes == []
+
+
+@pytest.mark.parametrize(
+    ("job", "rerun"),
+    [
+        (
+            {
+                "status": "completed",
+                "conclusion": "cancelled",
+                "started_at": "2026-01-01T00:00:00Z",
+                "steps": [],
+            },
+            True,
+        ),
+        ({"status": "completed", "conclusion": "cancelled", "runner_name": "ci-runner-121-abc"}, False),
+        (
+            {"status": "completed", "started_at": "2026-01-01T00:00:00Z", "steps": [{"name": "Set up job"}]},
+            False,
+        ),
+    ],
+)
+def test_a_cancelled_run_is_re_run_only_if_none_of_its_jobs_ran(job: dict, rerun: bool) -> None:
+    api = runs_api({"total_count": 1, "jobs": [job]})
+    runs = Runs(api)
+
+    assert runs.run_conclusion("o/r", 3) == "cancelled"
+    assert (runs.rerun_safely("o/r", 3) is None) is rerun
+    assert api.writes == ([("POST", "/repos/o/r/actions/runs/3/rerun", {})] if rerun else [])
+    assert api.conditional[JOBS] is False
+
+
+def test_a_run_with_more_jobs_than_listed_is_not_re_run() -> None:
+    untouched = {"status": "completed", "conclusion": "cancelled", "steps": []}
+    api = runs_api({"total_count": 101, "jobs": [untouched] * 100})
+
+    assert Runs(api).rerun_safely("o/r", 3) == "GitHub does not list all of its jobs"
+    assert api.writes == []
+
+
+def test_a_run_a_newer_run_of_its_workflow_and_branch_superseded_is_not_re_run() -> None:
+    api = runs_api({"total_count": 0, "jobs": []})
+    api.gets[NEWER] = {
+        "workflow_runs": [
+            {"id": 8, "created_at": "2026-01-01T00:05:00Z"},
+            {"id": 3, "created_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "created_at": "2025-12-31T23:00:00Z"},
+        ]
+    }
+
+    assert Runs(api).rerun_safely("o/r", 3) == "run 8 superseded it"
+    assert api.writes == []
+
+
+def test_a_run_superseded_within_the_same_second_is_not_re_run() -> None:
+    api = runs_api({"total_count": 0, "jobs": []})
+    api.gets[NEWER] = {
+        "workflow_runs": [
+            {"id": 4, "created_at": "2026-01-01T00:00:00Z"},
+            {"id": 3, "created_at": "2026-01-01T00:00:00Z"},
+        ]
+    }
+
+    assert Runs(api).rerun_safely("o/r", 3) == "run 4 superseded it"
+    assert api.writes == []
+
+
+def test_a_run_without_a_branch_is_never_re_run() -> None:
+    api = runs_api({"total_count": 0, "jobs": []})
+    api.gets["/repos/o/r/actions/runs/3"] = {"workflow_id": 11, "head_branch": None}
+
+    with pytest.raises(GitHubError, match="without a branch"):
+        Runs(api).rerun_safely("o/r", 3)
+    assert api.writes == []
+
+
+def test_the_conclusion_of_an_unfinished_run_is_unknown() -> None:
+    api = Api({
+        "/repos/o/r/actions/runs/4": {"status": "in_progress", "conclusion": None},
+        "/repos/o/r/actions/runs/5": {"status": "completed", "conclusion": None},
+    })
+
+    assert [Runs(api).run_conclusion("o/r", r) for r in (4, 5)] == [None, "unknown"]

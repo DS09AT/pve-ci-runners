@@ -228,6 +228,8 @@ class FakeGitHub:
         self.registered: dict[str, str] = {}
         self.removed: list[str] = []
         self.variables: dict[tuple[str, str], str] = {}
+        self.cancelled: list[int] = []
+        self.reruns: list[int] = []
 
     def queue(
         self, repository: str, labels: tuple[str, ...] = ("self-hosted", "pve-ci"), count: int = 1
@@ -269,6 +271,18 @@ class FakeGitHub:
 
     def set_variable(self, repository: str, name: str, value: str) -> None:
         self.variables[(repository, name)] = value
+
+    def cancel_unstarted(self, repository: str, run_id: int) -> bool:
+        self.cancelled.append(run_id)
+        self.queued[repository] = [j for j in self.queued.get(repository, []) if j.run_id != run_id]
+        return True
+
+    def rerun_safely(self, repository: str, run_id: int) -> str | None:
+        self.reruns.append(run_id)
+        return None
+
+    def run_conclusion(self, repository: str, run_id: int) -> str | None:
+        return "cancelled" if run_id in self.cancelled else None
 
 
 class FakeCache:

@@ -16,6 +16,7 @@ def test_the_base_configuration_parses_with_defaults() -> None:
     assert config.cache.mounts == DEFAULT_MOUNTS
     assert config.overflow is not None
     assert config.overflow.self_value == '["self-hosted","pve-ci"]'
+    assert config.overflow.reroute_after_seconds == 120
     assert config.daemon.poll_seconds == 15
     assert config.daemon.max_job_seconds == 23400
     assert str(config.network.network) == "192.168.100.0/24"
@@ -158,6 +159,21 @@ def test_overflow_values_must_be_runs_on_json(value: str) -> None:
 
     with pytest.raises(ConfigError, match="JSON"):
         parse(data)
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"), [(0, True), (86400, True), (-1, False), (86401, False), ("2m", False)]
+)
+def test_the_reroute_wait_is_checked(value: object, valid: bool) -> None:
+    data = config_data()
+    data["overflow"]["reroute_after_seconds"] = value
+
+    if valid:
+        overflow = parse(data).overflow
+        assert overflow is not None and overflow.reroute_after_seconds == value
+    else:
+        with pytest.raises(ConfigError, match="reroute_after_seconds"):
+            parse(data)
 
 
 def test_overflow_names_an_existing_profile() -> None:

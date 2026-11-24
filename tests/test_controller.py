@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from pve_ci_runners.actions import QueuedJob
 from pve_ci_runners.cache import cache_key
 from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.config import Config, parse
@@ -16,6 +17,7 @@ from pve_ci_runners.errors import CommandError, GitHubError, GuestError
 from pve_ci_runners.lifecycle import Lifecycle
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.pve import TAG
+from pve_ci_runners.reroute import Reroute
 from pve_ci_runners.state import VerifiedJob, decode
 from tests.conftest import config_data
 from tests.fakes import HEAD, Background, FakeCache, FakeGitHub, FakeHost, FakeVm, holds_memory_lock
@@ -1392,3 +1394,87 @@ def test_overflow_switches_on_while_a_slot_is_still_free_and_off_once_room_lasts
 
     assert overflow_value(github) != HOSTED
     assert "overflow off: 2 slots free and nothing unserved for 300 s" in caplog.text
+
+
+def rerouting(
+    config: Config, host: FakeHost, github: FakeGitHub, cache: FakeCache, clock: Clock
+) -> Controller:
+    assert config.overflow is not None
+    ctl = controller(config, host, github, cache, clock)
+    ctl._reroute = Reroute(config.overflow, github)
+    return ctl
+
+
+STALLED = QueuedJob(frozenset({"self-hosted", "pve-ci"}), 800.0, 7, True)
+
+
+def test_a_burst_bound_to_the_pool_is_re_run_once_overflow_is_on(setup, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    config, host, github, _, clock = setup
+    host.disk_bytes = config.capacity.disk_reserve_bytes - 1
+    github.queued["example-org/app"] = [STALLED] * 4
+    ctl = rerouting(*setup)
+
+    ctl.cycle()
+    assert overflow_value(github) == HOSTED and github.cancelled == [], "the variable was not hosted yet"
+
+    clock.now += 15
+    ctl.cycle()
+    assert github.cancelled == [7] and github.reruns == []
+
+    clock.now += 15
+    ctl.cycle()
+    assert github.reruns == [7]
+    assert "rerouted example-org/app run 7: 4 jobs waited 215 s" in caplog.text
+
+
+def test_a_repository_whose_warm_vm_is_assigned_in_the_same_cycle_is_not_rerouted(setup) -> None:
+    _, host, github, _, clock = setup
+    ctl = rerouting(*setup)
+    ctl.cycle()
+    ctl.cycle()
+    assert state(host, 121).phase == "warm"
+    assert ctl._overflow is not None
+    ctl._overflow.update(unserved=5, oldest_wait=0, free=0, now=clock.now)
+    assert overflow_value(github) == HOSTED
+    github.queued["example-org/app"] = [STALLED] * 5
+
+    ctl.cycle()
+    assert state(host, 121).phase == "assigned", "the longest waiting job gets the warm VM"
+    clock.now += 15
+    ctl.cycle()
+
+    assert github.cancelled == [], "an assigned runner that has not started may still take a job of the run"
+
+
+def test_nothing_is_rerouted_while_every_queued_job_has_a_vm(setup) -> None:
+    _, _, github, _, clock = setup
+    ctl = rerouting(*setup)
+    assert ctl._overflow is not None
+    ctl._overflow.update(unserved=5, oldest_wait=0, free=0, now=clock.now)
+    github.queued["example-org/app"] = [STALLED]
+
+    ctl.cycle()
+
+    assert github.cancelled == [], "the VM booting for the job serves it"
+
+
+def test_nothing_is_rerouted_while_overflow_is_off(tmp_path: Path) -> None:
+    data = config_data(daemon={"state_dir": str(tmp_path / "state"), "log_dir": str(tmp_path / "logs")})
+    data["overflow"]["on_wait_seconds"] = 600
+    config, host, github, cache, clock = parse(data), FakeHost(), FakeGitHub(), FakeCache(), Clock()
+    host.add_template(9201)
+    github.queued["example-org/app"] = [STALLED]
+
+    rerouting(config, host, github, cache, clock).cycle()
+
+    assert overflow_value(github) != HOSTED and github.cancelled == []
+
+
+def test_without_reroute_the_controller_cancels_nothing(setup) -> None:
+    _, _, github, _, _ = setup
+    github.queued["example-org/app"] = [STALLED] * 4
+
+    controller(*setup).cycle()
+
+    assert overflow_value(github) == HOSTED and github.cancelled == []

@@ -60,7 +60,7 @@ time, even while jobs run.
 | Permission | Access | Why |
 |---|---|---|
 | Administration (repository) | Read and write | create single-use runner registrations and remove them |
-| Actions (repository) | Read | list queued jobs and read which runner serves which job |
+| Actions (repository) | Read, or Read and write for reroute | list queued jobs and read which runner serves which job; with overflow and `reroute_after_seconds` above 0, cancel and re-run runs stuck on the pool |
 | Contents (repository) | Read | read the default branch's head commit, which proves that a run built that branch before its cache is written back; Administration already allows deploy keys, so this adds no reach |
 | Metadata (repository) | Read | mandatory for every App |
 | Variables (repository) | Read and write | only for overflow; leave it out otherwise |
@@ -173,6 +173,7 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # on_free_slots = 1                    # or once the profile could start no more than this many jobs
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
+# reroute_after_seconds = 120          # re-run a run whose jobs waited this long, none started; 0 = off
 ```
 
 `pve-ci-runners config check` validates the file and exits; it is safe to use as a configuration
@@ -236,6 +237,21 @@ while capacity hovers around one threshold. Both thresholds are at most the prof
 `off_free_slots` must exceed `on_free_slots`; by default they are 1 and 3, lowered to fit a smaller `max`.
 Draining, a failed isolation probe and jobs waiting without disk room switch overflow on regardless. Each
 switch is logged with its reason, for example `overflow on: 1 slot free`.
+
+A burst that arrives while the pool is idle still binds all its jobs to the pool before overflow switches
+on. While the variable points at the hosted runner and the `[overflow]` profile has unserved jobs, a run
+whose job has waited `reroute_after_seconds` for the `self_value` labels and of which no runner has picked
+up a job yet is cancelled and, once GitHub recorded the cancellation, re-run; the new attempt reads the
+variable again. Only first attempts whose jobs GitHub lists in full are considered, a repository with a
+runner that is assigned but has not started a job is skipped, and the jobs are read again right before
+the cancellation. Cancelling still starts the run's jobs with `if: always()` or `if: cancelled()`; if any
+job of the cancelled attempt ran, or a newer run of the same workflow and branch exists, the run is not
+re-run and a warning is logged. Each run is cancelled at
+most once per controller lifetime and at most five per cycle, and each re-run is logged as
+`rerouted <repository> run <id>: <n> jobs waited <s> s`. A re-run attempt shows the App as its triggering
+actor. Reroute needs the App permission Actions: Read and write; without it the controller logs one
+warning and stops rerouting until it restarts, and `pve-ci-runners doctor` fails its
+`reroute permission` check. Set `reroute_after_seconds = 0` to turn it off.
 
 ## Commands
 

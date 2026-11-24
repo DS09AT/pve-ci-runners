@@ -80,6 +80,7 @@ class Doctor:
             ("VMIDs", self._vmids),
             ("backup jobs", self._backups),
             ("GitHub App", self._app),
+            ("reroute permission", self._reroute),
             ("template", self._template),
         ]
         findings: list[Finding] = []
@@ -330,6 +331,20 @@ class Doctor:
             "GitHub App",
             f"missing {', '.join(missing)}",
             "grant them in the App settings, then accept them in the installation",
+        )
+
+    def _reroute(self) -> Finding:
+        overflow = self._config.overflow
+        if overflow is None or not overflow.reroute_after_seconds:
+            return Finding("ok", "reroute permission", "reroute is disabled")
+        if self._github.permissions().get("actions") == "write":
+            return Finding("ok", "reroute permission", "the App may cancel and re-run workflow runs")
+        return Finding(
+            "fail",
+            "reroute permission",
+            "reroute needs actions: write to cancel and re-run stalled workflow runs",
+            "grant Actions: Read and write in the App settings and accept it in the installation, "
+            "or set overflow.reroute_after_seconds = 0",
         )
 
     def _template(self) -> Finding:

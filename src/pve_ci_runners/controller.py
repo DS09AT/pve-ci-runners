@@ -22,6 +22,7 @@ from pve_ci_runners.logs import prune_logs
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.ports import DiskSpace, GitHubActions, Hypervisor
 from pve_ci_runners.pve import TAG, VmInfo
+from pve_ci_runners.reroute import Reroute
 from pve_ci_runners.scheduler import Demand, Plan, ProfileLimits, Round, plan_all
 from pve_ci_runners.state import VmState, decode
 from pve_ci_runners.templates import current_template, reserved_build_vms
@@ -35,6 +36,7 @@ log = logging.getLogger("pve_ci_runners")
 class _Demand:
     queued: dict[str, collections.Counter[str]] = field(default_factory=dict[str, collections.Counter[str]])
     oldest: dict[str, dict[str, float]] = field(default_factory=dict[str, dict[str, float]])
+    jobs: dict[str, list[QueuedJob]] = field(default_factory=dict[str, list[QueuedJob]])
 
 
 def profile_for(labels: frozenset[str], profiles: tuple[Profile, ...]) -> Profile | None:
@@ -58,6 +60,7 @@ class Controller:
         *,
         disk: DiskSpace,
         overflow: Overflow | None,
+        reroute: Reroute | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
@@ -66,6 +69,7 @@ class Controller:
         self._cache = cache
         self._disk = disk
         self._overflow = overflow
+        self._reroute = reroute
         self._clock = clock
         self._lifecycle = Lifecycle(config, hypervisor, github, cache, clock=clock)
         self._slots = {s.vmid: s for s in config.slots}
@@ -87,6 +91,7 @@ class Controller:
         demand = self._demand(repositories, now)
         busy = self._busy({s.repository for s in states.values() if s.repository})
         plans = self._plan(states, infos, demand, busy=busy, now=now)
+        self._reroute_runs(states, plans, demand, now)
         self._apply(plans, states, infos)
         self._update_overflow(plans, demand, now)
         if now - self._maintained_at >= _MAINTENANCE_INTERVAL:
@@ -261,6 +266,7 @@ class Controller:
             except PveCiError as err:
                 log.warning("%s: queued jobs unknown: %s", repository, err)
                 continue
+            demand.jobs[repository] = jobs
             self._count(demand, repository, jobs, now)
         return demand
 
@@ -428,6 +434,29 @@ class Controller:
             forced=forced,
         ):
             log.info("%s", line)
+
+    def _reroute_runs(
+        self, states: dict[int, VmState], plans: dict[str, Plan], demand: _Demand, now: float
+    ) -> None:
+        if self._reroute is not None and self._overflow is not None:
+            self._reroute.update(self._reroutable(self._overflow, states, plans, demand), now)
+
+    def _reroutable(
+        self, overflow: Overflow, states: dict[int, VmState], plans: dict[str, Plan], demand: _Demand
+    ) -> dict[str, list[QueuedJob]]:
+        """Queued jobs of the repositories whose runs may be cancelled now.
+
+        Only while the plan leaves jobs of the overflow profile unserved and the variable points at the
+        hosted runner. A repository with a runner that is assigned, in this cycle or earlier, but has not
+        started a job is skipped: that runner may take any queued job of the repository, and cancelling
+        its run would cut that job short.
+        """
+        name = self._config.overflow.profile if self._config.overflow else ""
+        if not plans.get(name, Plan()).unserved:
+            return {}
+        waiting = {s.repository for s in states.values() if s.phase == "assigned" and s.job_started is None}
+        waiting |= {repository for plan in plans.values() for _, repository in plan.assign}
+        return {r: j for r, j in demand.jobs.items() if r not in waiting and overflow.hosted(r)}
 
     def _maintain(self, states: dict[int, VmState]) -> None:
         in_use = {s.cache.clone for s in states.values() if s.cache is not None}

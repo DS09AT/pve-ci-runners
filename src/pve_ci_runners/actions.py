@@ -41,6 +41,10 @@ class QueuedJob:
 
     labels: frozenset[str]
     created_at: float
+    run_id: int = 0
+    # The run is in its first attempt and GitHub lists all of its jobs, none of them picked up by a
+    # runner and none finished other than skipped.
+    run_unstarted: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,16 +113,23 @@ class Actions:
                 run_id = _int(run.get("id"))
                 if run_id not in seen:
                     seen.add(run_id)
-                    jobs += self._queued_in(repository, run_id)
+                    jobs += self._queued_in(repository, run_id, first=run.get("run_attempt") == 1)
         return jobs
 
-    def _queued_in(self, repository: str, run_id: int) -> list[QueuedJob]:
-        jobs: list[QueuedJob] = []
-        for job in self._jobs(repository, run_id):
-            if job.get("status") == "queued":
-                labels = frozenset(label for label in _list(job.get("labels")) if isinstance(label, str))
-                jobs.append(QueuedJob(labels, _timestamp(job.get("created_at"))))
-        return jobs
+    def _queued_in(self, repository: str, run_id: int, *, first: bool) -> list[QueuedJob]:
+        answer = _jobs_page(self._api, repository, run_id)
+        jobs = _objs(answer.get("jobs"))
+        unstarted = first and _unstarted(answer)
+        return [
+            QueuedJob(
+                frozenset(label for label in _list(job.get("labels")) if isinstance(label, str)),
+                _timestamp(job.get("created_at")),
+                run_id,
+                unstarted,
+            )
+            for job in jobs
+            if job.get("status") == "queued"
+        ]
 
     def busy_runners(self, repository: str) -> frozenset[str]:
         """Names of the repository's runners that are running a job right now."""
@@ -198,13 +209,102 @@ class Actions:
             self._api.post(f"/repos/{repository}/actions/variables", {"name": name, "value": value})
 
     def _jobs(self, repository: str, run_id: int) -> list[dict[str, object]]:
-        answer = _obj(
+        return _objs(_jobs_page(self._api, repository, run_id).get("jobs"))
+
+
+class Runs:
+    """Cancels and re-runs whole workflow runs."""
+
+    def __init__(self, api: Api) -> None:
+        self._api = api
+
+    def cancel_unstarted(self, repository: str, run_id: int) -> bool:
+        """Cancels the run unless GitHub shows a job of it started by now; whether it was cancelled."""
+        if not _unstarted(_jobs_page(self._api, repository, run_id, conditional=False)):
+            return False
+        self._api.post(f"/repos/{repository}/actions/runs/{run_id}/cancel", {})
+        return True
+
+    def rerun_safely(self, repository: str, run_id: int) -> str | None:
+        """Re-runs the whole run and returns None, or returns why that would be unsafe.
+
+        A job of the cancelled attempt that ran would run twice. A newer run of the same workflow and
+        branch would be overtaken by the older commit, or cancelled by it through a concurrency group.
+        """
+        refusal = _rerun_refusal(_jobs_page(self._api, repository, run_id, conditional=False))
+        if refusal is not None:
+            return refusal
+        newer = self._newer_run(repository, run_id)
+        if newer is not None:
+            return f"run {newer} superseded it"
+        self._api.post(f"/repos/{repository}/actions/runs/{run_id}/rerun", {})
+        return None
+
+    def _newer_run(self, repository: str, run_id: int) -> int | None:
+        run = _obj(self._api.get(f"/repos/{repository}/actions/runs/{run_id}"))
+        branch = _str(run.get("head_branch"))
+        if not branch:
+            raise GitHubError("GitHub returned a run without a branch")
+        created = _timestamp(run.get("created_at"))
+        # GitHub lists the newest runs first, so one page shows a newer run if there is any.
+        listed = _obj(
             self._api.get(
-                f"/repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page={_PAGE}",
-                conditional=True,
+                f"/repos/{repository}/actions/workflows/{_int(run.get('workflow_id'))}/runs"
+                f"?branch={urllib.parse.quote(branch, safe='')}&per_page=5"
             )
         )
-        return _objs(answer.get("jobs"))
+        newer = [
+            _int(other.get("id"))
+            for other in _objs(listed.get("workflow_runs"))
+            # Run IDs only grow, so they also order runs created within the same second.
+            if _int(other.get("id")) > run_id or _timestamp(other.get("created_at")) > created
+        ]
+        return newer[0] if newer else None
+
+    def run_conclusion(self, repository: str, run_id: int) -> str | None:
+        """The run's conclusion, or None while it is not completed."""
+        run = _obj(self._api.get(f"/repos/{repository}/actions/runs/{run_id}"))
+        if run.get("status") != "completed":
+            return None
+        return _str(run.get("conclusion")) or "unknown"
+
+
+def _jobs_page(api: Api, repository: str, run_id: int, *, conditional: bool = True) -> dict[str, object]:
+    return _obj(
+        api.get(
+            f"/repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page={_PAGE}",
+            conditional=conditional,
+        )
+    )
+
+
+def _listed_in_full(answer: dict[str, object]) -> bool:
+    total = answer.get("total_count")
+    return not isinstance(total, bool) and isinstance(total, int) and total <= len(_objs(answer.get("jobs")))
+
+
+def _unstarted(answer: dict[str, object]) -> bool:
+    """Whether no listed job started; a run with more jobs than one page lists counts as started."""
+    return _listed_in_full(answer) and not any(_started(job) for job in _objs(answer.get("jobs")))
+
+
+def _rerun_refusal(answer: dict[str, object]) -> str | None:
+    if not _listed_in_full(answer):
+        return "GitHub does not list all of its jobs"
+    if any(_ran(job) for job in _objs(answer.get("jobs"))):
+        return "a job of it ran after all"
+    return None
+
+
+def _ran(job: dict[str, object]) -> bool:
+    # A job cancelled while queued may still carry a start time, but never a runner or a step.
+    return bool(job.get("runner_name")) or bool(job.get("started_at") and _list(job.get("steps")))
+
+
+def _started(job: dict[str, object]) -> bool:
+    if job.get("status") == "in_progress" or job.get("runner_name"):
+        return True
+    return job.get("status") == "completed" and job.get("conclusion") != "skipped"
 
 
 def _obj(value: object) -> dict[str, object]:
