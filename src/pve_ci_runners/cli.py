@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pve_ci_runners import config as configuration
 from pve_ci_runners._version import VERSION
-from pve_ci_runners.actions import Actions
+from pve_ci_runners.actions import Actions, Runs
 from pve_ci_runners.cache import CacheBackend, NoCache
 from pve_ci_runners.cache_zfs import ZfsCache
 from pve_ci_runners.controller import Controller
@@ -21,6 +21,7 @@ from pve_ci_runners.github import AppKeySigner, GitHubClient
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.proc import HostCommands
 from pve_ci_runners.pve import Pve
+from pve_ci_runners.reroute import Reroute
 from pve_ci_runners.status import collect
 from pve_ci_runners.teardown import Teardown
 from pve_ci_runners.template_build import TemplateBuilder
@@ -145,8 +146,10 @@ def _run(args: argparse.Namespace) -> int:
     loaded = configuration.load(args.config)
     configuration.check_secret_file(loaded.github.app_key_file)
     commands = HostCommands()
-    actions = Actions(_client(loaded, commands), allowed=loaded.github.repositories)
+    client = _client(loaded, commands)
+    actions = Actions(client, allowed=loaded.github.repositories)
     overflow = Overflow(loaded.overflow, actions) if loaded.overflow else None
+    reroute = Reroute(loaded.overflow, Runs(client)) if loaded.overflow else None
     controller = Controller(
         loaded,
         Pve(commands),
@@ -154,6 +157,7 @@ def _run(args: argparse.Namespace) -> int:
         _cache(loaded, commands),
         disk=disk_space(loaded, commands),
         overflow=overflow,
+        reroute=reroute,
     )
     log.info(
         "controller %s up: %d slots, profiles %s",

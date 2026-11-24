@@ -77,6 +77,11 @@ class Overflow:
         """Whether jobs are currently being sent to the hosted runner."""
         return self._state.on
 
+    def hosted(self, repository: str) -> bool:
+        """Whether the repository's variable was last written with the hosted value."""
+        written = self._written.get(repository)
+        return written is not None and written[0] == self._config.hosted_value
+
     def update(
         self, *, unserved: int, oldest_wait: float, free: int, now: float, forced: bool = False
     ) -> list[str]:

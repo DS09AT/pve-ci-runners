@@ -175,6 +175,7 @@ class OverflowConfig:
     on_free_slots: int
     off_free_slots: int
     off_seconds: int
+    reroute_after_seconds: int
 
 
 @dataclass(frozen=True)
@@ -487,6 +488,8 @@ def _overflow(s: Section | None, profiles: tuple[Profile, ...]) -> OverflowConfi
             "off_free_slots", default=min(3, chosen.maximum), minimum=1, maximum=chosen.maximum
         ),
         off_seconds=s.number("off_seconds", default=300, minimum=0),
+        # GitHub fails a job that waited a day for a runner, so a longer wait never reroutes anything.
+        reroute_after_seconds=s.number("reroute_after_seconds", default=120, minimum=0, maximum=86400),
     )
     s.done()
     if result.off_free_slots <= result.on_free_slots:

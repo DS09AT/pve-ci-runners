@@ -32,7 +32,7 @@ HEALTHY = {
 }
 ALL_GRANTED = {
     "administration": "write",
-    "actions": "read",
+    "actions": "write",
     "metadata": "read",
     "contents": "read",
     "actions_variables": "write",
@@ -160,6 +160,28 @@ def test_missing_app_permissions_and_an_old_runner_are_reported(config: Config) 
     assert "contents: read" in findings["GitHub App"].detail
     assert "actions_variables: write" in findings["GitHub App"].detail
     assert findings["template"].level == "warn" and "2.341.0" in findings["template"].detail
+
+
+@pytest.mark.parametrize(("actions", "level"), [("write", "ok"), ("read", "fail"), (None, "fail")])
+def test_reroute_needs_actions_write(config: Config, actions: str | None, level: str) -> None:
+    granted = {k: v for k, v in ALL_GRANTED.items() if k != "actions"}
+    if actions is not None:
+        granted["actions"] = actions
+
+    finding = run(config, HEALTHY, app=App(granted))["reroute permission"]
+
+    assert finding.level == level
+    assert level == "ok" or "reroute_after_seconds = 0" in finding.fix
+
+
+@pytest.mark.parametrize("overflow", [None, {"reroute_after_seconds": 0}])
+def test_reroute_permission_is_not_needed_while_reroute_is_off(config: Config, overflow) -> None:
+    assert config.overflow is not None
+    changed = replace(config, overflow=None if overflow is None else replace(config.overflow, **overflow))
+
+    finding = run(changed, HEALTHY, app=App({**ALL_GRANTED, "actions": "read"}))["reroute permission"]
+
+    assert finding.level == "ok" and "disabled" in finding.detail
 
 
 def test_a_key_file_others_can_read_fails(config: Config) -> None:
