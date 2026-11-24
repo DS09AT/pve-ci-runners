@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.6.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.3...v0.6.0) (2026-11-24)
+
+
+### Features
+
+* switch overflow on before the runners are full ([6c3cf60](https://github.com/DS09AT/pve-ci-runners/commit/6c3cf60067f03c62a1ef1c16392314389f3632c6))
+
 ## [0.5.3](https://github.com/DS09AT/pve-ci-runners/compare/v0.5.2...v0.5.3) (2026-11-23)
 
 
