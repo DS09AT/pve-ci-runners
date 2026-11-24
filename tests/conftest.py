@@ -40,6 +40,10 @@ BASE: dict[str, Any] = {
         "variable": "CI_RUNS_ON",
         "hosted_value": '"ubuntu-latest"',
         "repositories": ["example-org/app"],
+        # Two slots leave no room for the free-slot defaults to tell a busy pool from an idle one.
+        "on_free_slots": 0,
+        "off_free_slots": 1,
+        "off_seconds": 60,
     },
 }
 

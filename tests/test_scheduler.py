@@ -21,7 +21,18 @@ def plan(vms, free, queued=None, waiting=None, busy=frozenset(), limits=LIMITS, 
 
 
 def test_an_idle_host_fills_its_warm_pool() -> None:
-    assert plan({}, [121, 122]) == Plan(create=(121, 122))
+    assert plan({}, [121, 122]) == Plan(create=(121, 122), spare=2)
+
+
+def test_spare_counts_the_jobs_the_profile_could_still_take_at_once() -> None:
+    busy = {121: assigned("x", "o/r", started=995), 122: assigned("y", "o/r", started=995)}
+    assert plan(busy, [], busy={"x", "y"}).spare == 0, "a saturated pool has no spare"
+    assert plan({121: WARM}, [122]).spare == 2, "a warm VM and a free slot"
+    assert plan({121: WARM}, [122], {"o/r": 1}).spare == 1, "the warm VM serves the job"
+    assert plan({121: WARM}, [122], limits=ProfileLimits(2, 2, can_start=0)).spare == 1, "memory is short"
+    assert plan({121: BOOTING}, [], {"o/r": 1}).spare == 0, "the booting VM is claimed by the job"
+    assert plan({121: BOOTING}, []).spare == 1
+    assert plan({}, [121, 122], {"o/r": 3}).spare == 0
 
 
 def test_a_warm_vm_takes_a_queued_job_and_a_new_one_boots() -> None:

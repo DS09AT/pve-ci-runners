@@ -423,3 +423,38 @@ def test_the_assign_timeout_defaults_to_ten_minutes_and_stays_below_the_job_life
 
     with pytest.raises(ConfigError, match="assign_timeout_seconds"):
         parse(data)
+
+
+def overflow_data(slots: int, **overflow: object) -> dict[str, object]:
+    """A pool of `slots` slots, all of them held by one profile, without the base overflow thresholds."""
+    data = config_data(capacity={"memory_mb": 5120 * slots, "host_reserve_mb": 4096})
+    data["slot"] = [{"vmid": 121 + i, "address": f"192.168.100.{21 + i}"} for i in range(slots)]
+    data["profile"][0]["max"] = slots
+    for key in ("on_free_slots", "off_free_slots", "off_seconds"):
+        del data["overflow"][key]
+    data["overflow"] |= overflow
+    return data
+
+
+@pytest.mark.parametrize(("slots", "on", "off"), [(5, 1, 3), (2, 1, 2), (1, 0, 1)])
+def test_overflow_free_slot_defaults_fit_the_profile(slots: int, on: int, off: int) -> None:
+    overflow = parse(overflow_data(slots)).overflow
+
+    assert overflow is not None
+    assert (overflow.on_free_slots, overflow.off_free_slots, overflow.off_seconds) == (on, off, 300)
+
+
+@pytest.mark.parametrize(
+    ("overflow", "message"),
+    [
+        ({"on_free_slots": 3, "off_free_slots": 3}, "off_free_slots: must exceed on_free_slots"),
+        ({"on_free_slots": 4}, "off_free_slots: must exceed on_free_slots"),
+        ({"off_free_slots": 6}, "off_free_slots: must be between 1 and 5"),
+        ({"on_free_slots": 6, "off_free_slots": 5}, "on_free_slots: must be between 0 and 5"),
+        ({"on_free_slots": -1}, "on_free_slots: must be between 0 and 5"),
+        ({"off_free_slots": 0, "on_free_slots": 0}, "off_free_slots: must be between 1 and 5"),
+    ],
+)
+def test_overflow_free_slot_thresholds_are_checked(overflow: dict[str, int], message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        parse(overflow_data(5, **overflow))

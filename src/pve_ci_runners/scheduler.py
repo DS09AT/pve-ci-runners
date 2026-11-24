@@ -37,6 +37,7 @@ class Plan:
     retire: tuple[int, ...] = ()
     unserved: int = 0
     stuck: tuple[int, ...] = ()
+    spare: int = 0
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,8 @@ def plan_profile(
     is never served twice, but only until the assign timeout: a runner that took no job by then is stuck,
     and is retired even while jobs wait, so another VM can serve them. A runner that has started a job is
     never retired, whatever the API reports in between. Each warm VM goes to the repository with the
-    fewest VMs, then the oldest waiting job.
+    fewest VMs, then the oldest waiting job. `spare` counts the further jobs the profile could take at
+    once: warm and booting VMs no queued job claims, plus the VMs that slots, memory and disk still allow.
     """
     assigned = {v: s for v, s in vms.items() if s.phase == "assigned"}
     idle = {v: s for v, s in assigned.items() if s.runner not in current.busy and s.job_started is None}
@@ -80,14 +82,15 @@ def plan_profile(
     # The warm pool is refilled from what assignments leave over, not from what was warm before.
     still_warm = len(warm) - len(assign)
     wanted = max(0, unmet - booting) + max(0, limits.warm - still_warm - max(0, booting - unmet))
-    room = max(0, limits.maximum - (len(vms) - len(retire)))
-    count = min(wanted, room, len(free_slots), limits.can_start)
+    startable = min(max(0, limits.maximum - (len(vms) - len(retire))), len(free_slots), limits.can_start)
+    count = min(wanted, startable)
     return Plan(
         assign=tuple(assign),
         create=tuple(sorted(free_slots)[:count]),
         retire=retire,
         unserved=max(0, unmet - booting - count),
         stuck=stuck,
+        spare=max(0, still_warm + booting + startable - unmet),
     )
 
 
