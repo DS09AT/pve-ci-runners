@@ -1,6 +1,6 @@
 [project]
 name = "pve-ci-runners"
-version = "0.6.0"
+version = "0.7.0"
 description = "Run every GitHub Actions job in a fresh Proxmox VE virtual machine with a copy-on-write cache."
 readme = "README.md"
 license = "MIT"
