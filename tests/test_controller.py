@@ -1366,3 +1366,29 @@ def test_no_disk_room_starts_nothing_and_counts_each_job_once(setup, monkeypatch
 
     assert reported == [1]
     assert "not starting VM" not in caplog.text and set(host.machines) == {9201}
+
+
+def test_overflow_switches_on_while_a_slot_is_still_free_and_off_once_room_lasts(setup, caplog) -> None:
+    config, host, github, cache, clock = setup
+    assert config.overflow is not None
+    thresholds = replace(config.overflow, on_free_slots=1, off_free_slots=2, off_seconds=300)
+    setup = (replace(config, overflow=thresholds), host, github, cache, clock)
+    caplog.set_level(logging.INFO, logger="pve_ci_runners")
+
+    ctl = started_job(setup)
+    assert overflow_value(github) == HOSTED, "runs created now would lock onto the last slot"
+    assert "overflow on: 1 slot free" in caplog.text
+
+    host.machines[121].done = True
+    github.conclusions[42] = "success"
+    ctl.cycle()
+    assert 121 not in host.machines
+    for _ in range(300 // config.daemon.poll_seconds):
+        clock.now += config.daemon.poll_seconds
+        ctl.cycle()
+        assert overflow_value(github) == HOSTED, "the pool must have room for a while first"
+    clock.now += config.daemon.poll_seconds
+    ctl.cycle()
+
+    assert overflow_value(github) != HOSTED
+    assert "overflow off: 2 slots free and nothing unserved for 300 s" in caplog.text

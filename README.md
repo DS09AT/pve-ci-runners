@@ -14,7 +14,7 @@ copy-on-write cache per workflow job.
   low CPU priority keep production VMs first.
 - **No inbound port, no extra service.** One stdlib-only Python daemon on the Proxmox node polls GitHub as a
   GitHub App. It talks to the VMs only through the QEMU guest agent; the VMs run no SSH server.
-- **Overflow when busy.** Optionally, while all VMs are busy, the controller points a repository variable at
+- **Overflow when busy.** Optionally, before all VMs are busy, the controller points a repository variable at
   a hosted runner label, so queued work keeps moving.
 
 > Status: alpha. Proxmox VE 9 on amd64, private repositories, one controller per Proxmox node.
@@ -168,6 +168,11 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # self_value = '["self-hosted", "pve-ci"]'
 # hosted_value = '"ubuntu-latest"'
 # repositories = ["example-org/app"]
+# on_backlog = 2                       # switch on once this many jobs have no VM,
+# on_wait_seconds = 120                # once a job has waited this long,
+# on_free_slots = 1                    # or once the profile could start no more than this many jobs
+# off_free_slots = 3                   # switch off only while nothing waits and this many are free
+# off_seconds = 300                    # without a break for this long
 ```
 
 `pve-ci-runners config check` validates the file and exits; it is safe to use as a configuration
@@ -219,6 +224,18 @@ The DNS servers in `network.dns` must lie outside every denied network, or the V
 
 `network.rate` limits the NIC of every runner and build VM, in MB/s. A profile's `disk_limits`
 (`mbps_rd`, `mbps_wr`, `iops_rd`, `iops_wr`) apply to the root disk and to the hot-plugged cache disk.
+
+GitHub reads `vars.<variable>` once, when a workflow run is created, and every job of that run keeps the
+value of that moment, even one queued long after `[overflow]` switched. Overflow therefore looks ahead:
+besides `on_backlog` jobs without a VM and a job waiting `on_wait_seconds`, it switches on as soon as the
+`[overflow]` profile could start no more than `on_free_slots` further jobs at once. That number counts
+warm and booting VMs no queued job claims, plus the VMs that free slots, the profile's `max`, the memory
+budget, the host reserve and the disk reserve still allow. It switches off only after nothing was unserved
+and at least `off_free_slots` stayed free for `off_seconds` without a break, so the variable does not flap
+while capacity hovers around one threshold. Both thresholds are at most the profile's `max`, and
+`off_free_slots` must exceed `on_free_slots`; by default they are 1 and 3, lowered to fit a smaller `max`.
+Draining, a failed isolation probe and jobs waiting without disk room switch overflow on regardless. Each
+switch is logged with its reason, for example `overflow on: 1 slot free`.
 
 ## Commands
 

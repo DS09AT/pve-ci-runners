@@ -412,7 +412,8 @@ class Controller:
         name = self._config.overflow.profile if self._config.overflow else ""
         waiting = demand.oldest.get(name, {}).values()
         oldest_wait = now - min(waiting) if waiting else 0.0
-        unserved = plans[name].unserved if name in plans else 0
+        plan = plans.get(name, Plan())
+        unserved = plan.unserved
         # Without disk room no start can succeed, so waiting for one would only delay the jobs.
         forced = (
             draining(self._config.daemon.state_dir)
@@ -422,6 +423,7 @@ class Controller:
         for line in self._overflow.update(
             unserved=unserved,
             oldest_wait=oldest_wait,
+            free=plan.spare,
             now=now,
             forced=forced,
         ):

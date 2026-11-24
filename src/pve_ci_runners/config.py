@@ -172,6 +172,8 @@ class OverflowConfig:
     repositories: tuple[str, ...]
     on_backlog: int
     on_wait_seconds: int
+    on_free_slots: int
+    off_free_slots: int
     off_seconds: int
 
 
@@ -479,9 +481,16 @@ def _overflow(s: Section | None, profiles: tuple[Profile, ...]) -> OverflowConfi
         repositories=s.texts("repositories", pattern=REPOSITORY, minimum=1),
         on_backlog=s.number("on_backlog", default=2, minimum=1),
         on_wait_seconds=s.number("on_wait_seconds", default=120, minimum=0),
-        off_seconds=s.number("off_seconds", default=60, minimum=0),
+        # The profile never holds more than `max` VMs, so a larger threshold would never switch off.
+        on_free_slots=s.number("on_free_slots", default=min(1, chosen.maximum - 1), maximum=chosen.maximum),
+        off_free_slots=s.number(
+            "off_free_slots", default=min(3, chosen.maximum), minimum=1, maximum=chosen.maximum
+        ),
+        off_seconds=s.number("off_seconds", default=300, minimum=0),
     )
     s.done()
+    if result.off_free_slots <= result.on_free_slots:
+        raise s.error("off_free_slots", "must exceed on_free_slots")
     for key, value in (("self_value", result.self_value), ("hosted_value", result.hosted_value)):
         _require_runs_on_json(s, key, value)
     return result
