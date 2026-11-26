@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.10.3](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.2...v0.10.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* reuse a slot sooner after its job ends ([7ace8cf](https://github.com/DS09AT/pve-ci-runners/commit/7ace8cf9c63defa9f6a9c1848a4df08b340b2f52))
+
 ## [0.10.2](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.1...v0.10.2) (2026-11-26)
 
 
