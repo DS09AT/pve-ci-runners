@@ -213,7 +213,8 @@ class Lifecycle:
 
         A check counts only for the phase and runner it was started for, so no answer reaches a later VM in
         the slot. An exit is final: it is kept, so a finished runner whose cache is still tidied never
-        looks unfinished again. Any other answer is asked anew; a failed check raises its error.
+        looks unfinished again. A "not yet" queues the next check at once, so the next cycle reads a fresh
+        answer instead of starting one; a failed check raises its error and the next cycle asks anew.
         """
         key = (state.phase, state.since, state.runner)
         check = self._checks.get(vmid)
@@ -221,8 +222,10 @@ class Lifecycle:
             check = self._checks[vmid] = (key, self._checker.submit(self._guest.finished, vmid))
         if not check[1].done():
             return None
-        if check[1].exception() is not None or not check[1].result():
+        if check[1].exception() is not None:
             del self._checks[vmid]
+        elif not check[1].result():
+            self._checks[vmid] = (key, self._checker.submit(self._guest.finished, vmid))
         return check[1].result()
 
     def outlived_job(self, vmid: int, state: VmState) -> bool:

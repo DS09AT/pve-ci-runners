@@ -86,7 +86,11 @@ class Controller:
         now = self._clock()
         repositories = self._served_repositories(now)
         infos = self._pve.vms()
-        states = self._advance(self._states(infos), repositories, now)
+        found = self._states(infos)
+        states = self._advance(found, repositories, now)
+        if len(states) < len(found):
+            # A VM removed just now frees its slot and its memory for a start in this same cycle.
+            infos = self._pve.vms()
         states = self._make_disk_room(states, repositories)
         demand = self._demand(repositories, now)
         busy = self._busy({s.repository for s in states.values() if s.repository})
