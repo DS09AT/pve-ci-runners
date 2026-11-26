@@ -468,8 +468,9 @@ def test_overflow_free_slot_defaults_fit_the_profile(slots: int, on: int, off: i
         ({"on_free_slots": 3, "off_free_slots": 3}, "off_free_slots: must exceed on_free_slots"),
         ({"on_free_slots": 4}, "off_free_slots: must exceed on_free_slots"),
         ({"off_free_slots": 6}, "off_free_slots: must be between 1 and 5"),
-        ({"on_free_slots": 6, "off_free_slots": 5}, "on_free_slots: must be between 0 and 5"),
-        ({"on_free_slots": -1}, "on_free_slots: must be between 0 and 5"),
+        ({"on_free_slots": 6, "off_free_slots": 5}, "on_free_slots: must be between -1 and 5"),
+        ({"on_free_slots": -2}, "on_free_slots: must be between -1 and 5"),
+        ({"on_backlog": -1}, "on_backlog: must be between 0 and"),
         ({"off_free_slots": 0, "on_free_slots": 0}, "off_free_slots: must be between 1 and 5"),
     ],
 )
