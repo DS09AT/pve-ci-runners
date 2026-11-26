@@ -79,6 +79,10 @@ class Controller:
         # Counted in memory only: after a restart a broken guest just fails its checks once more.
         self._failures: dict[int, int] = {}
         self._disk_room = 0
+        self._disk_measured = False
+        # Slot VMs whose finished job is still being wrapped up, and those this cycle removed, by profile.
+        self._wrapping: dict[int, str] = {}
+        self._removed: dict[int, str] = {}
         self.blocked: str | None = None
 
     def cycle(self) -> None:
@@ -91,9 +95,10 @@ class Controller:
         demand = self._demand(repositories, now)
         busy = self._busy({s.repository for s in states.values() if s.repository})
         plans = self._plan(states, infos, demand, busy=busy, now=now)
+        capacity = self._capacity(states, infos, demand, busy=busy, now=now)
         self._reroute_runs(states, plans, demand, now)
         self._apply(plans, states, infos)
-        self._update_overflow(plans, demand, now)
+        self._update_overflow(plans, demand, now, capacity=capacity)
         if now - self._maintained_at >= _MAINTENANCE_INTERVAL:
             self._maintain(states)
             self._maintained_at = now
@@ -144,10 +149,12 @@ class Controller:
             v: n for v, n in self._failures.items() if v in states and states[v].phase != "booting"
         }
         result: dict[int, VmState] = {}
+        self._wrapping = {}
         for vmid, state in states.items():
             kept = self._advance_guarded(vmid, state, repositories, now)
             if kept is not None:
                 result[vmid] = kept
+        self._removed = {v: s.profile for v, s in states.items() if v not in result}
         return result
 
     def _advance_guarded(
@@ -211,11 +218,18 @@ class Controller:
             self._lifecycle.retire(vmid, state, repositories)
             return None
         if not state.running or self._guest_finished(vmid, state):
-            return None if self._lifecycle.finish(vmid, state, repositories) else state
+            return self._wrapped_up(vmid, state, repositories)
         if self._retired_as_broken(vmid, state, repositories) or self._retired_as_ended(
             vmid, state, repositories
         ):
             return None
+        return state
+
+    def _wrapped_up(self, vmid: int, state: VmState, repositories: dict[str, str]) -> VmState | None:
+        """Finishes a VM whose runner exited; until that is done its slot is on its way to be free."""
+        if self._lifecycle.finish(vmid, state, repositories):
+            return None
+        self._wrapping[vmid] = state.profile
         return state
 
     def _retired_as_ended(self, vmid: int, state: VmState, repositories: dict[str, str]) -> bool:
@@ -310,6 +324,7 @@ class Controller:
                 del kept[vmid]
                 room += 1
         self._disk_room = -1 if room is None else room
+        self._disk_measured = room is not None
         return kept
 
     def _disk_fit(self, states: dict[int, VmState]) -> int | None:
@@ -333,32 +348,81 @@ class Controller:
         *,
         busy: frozenset[str],
         now: float,
+        recycled: "_Recycled | None" = None,
     ) -> dict[str, Plan]:
+        """The plan of this round, or, with `recycled`, the plan as if those slot VMs were gone already.
+
+        `infos` was read before this cycle removed VMs, so every recycled VM frees its slot and its share
+        of the runner budget here. Host memory and disk room are measured after the removals, so only the
+        VMs still on the node add their memory and disk reserve back.
+        """
+        existing = recycled.existing if recycled else frozenset[int]()
+        released = existing | recycled.removed if recycled else existing
         held = draining(self._config.daemon.state_dir) or self.blocked is not None
-        free = [v for v in self._slots if v not in infos]
+        left = {v: i for v, i in infos.items() if v not in released}
+        free = [v for v in self._slots if v not in left]
         # Without a template nothing can start, so the jobs count as unserved and overflow can take them.
         startable = bool(free) and not held and self._template(infos) is not None
-        host = self._pve.host_memory(reserved_build_vms(self._config)) if startable else None
-        budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
-        inputs = []
-        for profile in self._config.profiles:
-            # Without disk room an idle VM cannot take a job, so it must not count as serving one.
-            vms = {
-                v: s
-                for v, s in states.items()
-                if s.profile == profile.name and (self._disk_room >= 0 or s.phase == "assigned")
-            }
-            queued = {} if held else dict(demand.queued.get(profile.name, {}))
-            can_start = (
-                0 if host is None else min(self._fits(host, budget_left, profile), max(0, self._disk_room))
-            )
-            limits = ProfileLimits(
-                warm=0 if held else profile.warm, maximum=profile.maximum, can_start=can_start
-            )
-            inputs.append((profile.name, vms, Demand(queued, demand.oldest.get(profile.name, {})), limits))
+        room = _Room(
+            self._host(infos, existing) if startable else None,
+            self._config.capacity.memory_mb - self._runner_memory(left),
+            self._disk_after(existing),
+        )
+        kept = {v: s for v, s in states.items() if v not in released}
+        inputs = [self._profile_input(p, kept, demand, room, held=held) for p in self._config.profiles]
         daemon = self._config.daemon
         current = Round(busy, now, daemon.idle_timeout_seconds, daemon.assign_timeout_seconds)
         return plan_all(inputs, free, current=current)
+
+    def _profile_input(
+        self, profile: Profile, states: dict[int, VmState], demand: _Demand, room: "_Room", *, held: bool
+    ) -> tuple[str, dict[int, VmState], Demand, ProfileLimits]:
+        # Without disk room an idle VM cannot take a job, so it must not count as serving one.
+        vms = {
+            v: s
+            for v, s in states.items()
+            if s.profile == profile.name and (room.disk >= 0 or s.phase == "assigned")
+        }
+        queued = {} if held else dict(demand.queued.get(profile.name, {}))
+        can_start = (
+            0 if room.host is None else min(self._fits(room.host, room.budget_mb, profile), max(0, room.disk))
+        )
+        limits = ProfileLimits(warm=0 if held else profile.warm, maximum=profile.maximum, can_start=can_start)
+        return profile.name, vms, Demand(queued, demand.oldest.get(profile.name, {})), limits
+
+    def _disk_after(self, existing: frozenset[int]) -> int:
+        # An unmeasured disk takes no VM, however many reserves the VMs being recycled would give back.
+        return self._disk_room + len(existing) if self._disk_measured else self._disk_room
+
+    def _host(self, infos: dict[int, VmInfo], existing: frozenset[int]) -> HostMemory:
+        host = self._pve.host_memory(reserved_build_vms(self._config))
+        freed = sum(infos[v].memory_mb for v in existing if v in infos)
+        return HostMemory(host.total_mb, host.committed_mb - freed)
+
+    def _capacity(
+        self,
+        states: dict[int, VmState],
+        infos: dict[int, VmInfo],
+        demand: _Demand,
+        *,
+        busy: frozenset[str],
+        now: float,
+    ) -> int | None:
+        """The jobs the overflow profile could start at once, counting its slots being recycled as free.
+
+        A finished VM is wrapped up, destroyed and cloned anew within about a minute, so a run created in
+        that window would otherwise see the pool as full. None when nothing is recycled or nobody reads it.
+        """
+        overflow = self._config.overflow
+        if overflow is None or not overflow.capacity_variable:
+            return None
+        existing = frozenset(v for v, p in self._wrapping.items() if p == overflow.profile)
+        released = existing | {v for v, p in self._removed.items() if p == overflow.profile}
+        if not released:
+            return None
+        recycled = _Recycled(existing, released - existing)
+        plan = self._plan(states, infos, demand, busy=busy, now=now, recycled=recycled)
+        return plan.get(overflow.profile, Plan()).spare
 
     def _runner_memory(self, infos: dict[int, VmInfo]) -> int:
         return sum(i.memory_mb for v, i in infos.items() if v in self._slots)
@@ -412,7 +476,9 @@ class Controller:
                     committed += profile.memory_mb
                     self._disk_room -= 1
 
-    def _update_overflow(self, plans: dict[str, Plan], demand: _Demand, now: float) -> None:
+    def _update_overflow(
+        self, plans: dict[str, Plan], demand: _Demand, now: float, *, capacity: int | None = None
+    ) -> None:
         if self._overflow is None:
             return
         name = self._config.overflow.profile if self._config.overflow else ""
@@ -432,6 +498,7 @@ class Controller:
             free=plan.spare,
             now=now,
             forced=forced,
+            capacity=capacity,
         ):
             log.info("%s", line)
 
@@ -469,6 +536,23 @@ class Controller:
 
     def _description(self, vmid: int) -> str:
         return str(self._pve.config(vmid).get("description", ""))
+
+
+@dataclass(frozen=True)
+class _Recycled:
+    """Slot VMs on their way to be free: still being wrapped up, or removed this cycle."""
+
+    existing: frozenset[int]
+    removed: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _Room:
+    """What a round may still start: host memory, the runner memory budget and the disk reserves."""
+
+    host: HostMemory | None
+    budget_mb: int
+    disk: int
 
 
 def _guarded(vmid: int, action: Callable[[], object]) -> bool:
