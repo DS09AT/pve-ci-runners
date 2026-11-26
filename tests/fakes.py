@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
-from pve_ci_runners.actions import QueuedJob, Registration
+from pve_ci_runners.actions import QueuedJob, Registration, RunSummary
 from pve_ci_runners.cache import Attachment
 from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.errors import CommandError, GitHubError, GuestError
@@ -272,12 +272,14 @@ class FakeGitHub:
     def set_variable(self, repository: str, name: str, value: str) -> None:
         self.variables[(repository, name)] = value
 
-    def cancel_unstarted(self, repository: str, run_id: int) -> bool:
+    def summary(self, repository: str, run_id: int) -> RunSummary:
+        return next(j.run for j in self.queued.get(repository, []) if j.run_id == run_id and j.run)
+
+    def cancel(self, repository: str, run_id: int) -> None:
         self.cancelled.append(run_id)
         self.queued[repository] = [j for j in self.queued.get(repository, []) if j.run_id != run_id]
-        return True
 
-    def rerun_safely(self, repository: str, run_id: int) -> str | None:
+    def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
         self.reruns.append(run_id)
         return None
 

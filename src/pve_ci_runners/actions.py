@@ -36,15 +36,26 @@ class Api(Protocol):
 
 
 @dataclass(frozen=True)
+class RunSummary:
+    """What deciding a reroute needs to know about the latest attempt of a run."""
+
+    # The run is in its first attempt and GitHub lists all of its jobs.
+    complete: bool
+    event: str
+    # No job was picked up by a runner and none finished other than skipped.
+    unstarted: bool
+    # When each job a runner holds right now started; a time GitHub does not report counts as the epoch.
+    running: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
 class QueuedJob:
     """A job waiting for a runner."""
 
     labels: frozenset[str]
     created_at: float
     run_id: int = 0
-    # The run is in its first attempt and GitHub lists all of its jobs, none of them picked up by a
-    # runner and none finished other than skipped.
-    run_unstarted: bool = False
+    run: RunSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -113,19 +124,19 @@ class Actions:
                 run_id = _int(run.get("id"))
                 if run_id not in seen:
                     seen.add(run_id)
-                    jobs += self._queued_in(repository, run_id, first=run.get("run_attempt") == 1)
+                    jobs += self._queued_in(repository, run_id, run)
         return jobs
 
-    def _queued_in(self, repository: str, run_id: int, *, first: bool) -> list[QueuedJob]:
+    def _queued_in(self, repository: str, run_id: int, run: dict[str, object]) -> list[QueuedJob]:
         answer = _jobs_page(self._api, repository, run_id)
         jobs = _objs(answer.get("jobs"))
-        unstarted = first and _unstarted(answer)
+        summary = _summary(run, answer)
         return [
             QueuedJob(
                 frozenset(label for label in _list(job.get("labels")) if isinstance(label, str)),
                 _timestamp(job.get("created_at")),
                 run_id,
-                unstarted,
+                summary,
             )
             for job in jobs
             if job.get("status") == "queued"
@@ -213,31 +224,34 @@ class Actions:
 
 
 class Runs:
-    """Cancels and re-runs whole workflow runs."""
+    """Cancels workflow runs and re-runs their cancelled and failed jobs."""
 
     def __init__(self, api: Api) -> None:
         self._api = api
 
-    def cancel_unstarted(self, repository: str, run_id: int) -> bool:
-        """Cancels the run unless GitHub shows a job of it started by now; whether it was cancelled."""
-        if not _unstarted(_jobs_page(self._api, repository, run_id, conditional=False)):
-            return False
+    def summary(self, repository: str, run_id: int) -> RunSummary:
+        """The run as GitHub shows it right now, never from a cached answer."""
+        run = _obj(self._api.get(f"/repos/{repository}/actions/runs/{run_id}"))
+        return _summary(run, _jobs_page(self._api, repository, run_id, conditional=False))
+
+    def cancel(self, repository: str, run_id: int) -> None:
+        """Cancels every job of the run that has not finished."""
         self._api.post(f"/repos/{repository}/actions/runs/{run_id}/cancel", {})
-        return True
 
-    def rerun_safely(self, repository: str, run_id: int) -> str | None:
-        """Re-runs the whole run and returns None, or returns why that would be unsafe.
+    def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
+        """Re-runs the run's cancelled and failed jobs and returns None, or returns why that is unsafe.
 
-        A job of the cancelled attempt that ran would run twice. A newer run of the same workflow and
-        branch would be overtaken by the older commit, or cancelled by it through a concurrency group.
+        Finished jobs stay as they are. With `strict`, a job of the cancelled attempt that ran refuses
+        the re-run, because it would run twice. A newer run of the same workflow and branch always
+        refuses it: the older commit would overtake it, or cancel it through a concurrency group.
         """
-        refusal = _rerun_refusal(_jobs_page(self._api, repository, run_id, conditional=False))
+        refusal = _rerun_refusal(_jobs_page(self._api, repository, run_id, conditional=False), strict=strict)
         if refusal is not None:
             return refusal
         newer = self._newer_run(repository, run_id)
         if newer is not None:
             return f"run {newer} superseded it"
-        self._api.post(f"/repos/{repository}/actions/runs/{run_id}/rerun", {})
+        self._api.post(f"/repos/{repository}/actions/runs/{run_id}/rerun-failed-jobs", {})
         return None
 
     def _newer_run(self, repository: str, run_id: int) -> int | None:
@@ -283,15 +297,28 @@ def _listed_in_full(answer: dict[str, object]) -> bool:
     return not isinstance(total, bool) and isinstance(total, int) and total <= len(_objs(answer.get("jobs")))
 
 
-def _unstarted(answer: dict[str, object]) -> bool:
-    """Whether no listed job started; a run with more jobs than one page lists counts as started."""
-    return _listed_in_full(answer) and not any(_started(job) for job in _objs(answer.get("jobs")))
+def _summary(run: dict[str, object], answer: dict[str, object]) -> RunSummary:
+    jobs = _objs(answer.get("jobs"))
+    held = [j for j in jobs if j.get("status") != "completed" and _started(j)]
+    return RunSummary(
+        complete=run.get("run_attempt") == 1 and _listed_in_full(answer),
+        event=_str(run.get("event")),
+        unstarted=not any(_started(job) for job in jobs),
+        running=tuple(_start(job) for job in held),
+    )
 
 
-def _rerun_refusal(answer: dict[str, object]) -> str | None:
+def _start(job: dict[str, object]) -> float:
+    try:
+        return _timestamp(job.get("started_at"))
+    except GitHubError:
+        return 0.0
+
+
+def _rerun_refusal(answer: dict[str, object], *, strict: bool) -> str | None:
     if not _listed_in_full(answer):
         return "GitHub does not list all of its jobs"
-    if any(_ran(job) for job in _objs(answer.get("jobs"))):
+    if strict and any(_ran(job) for job in _objs(answer.get("jobs"))):
         return "a job of it ran after all"
     return None
 

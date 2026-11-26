@@ -17,6 +17,7 @@ def test_the_base_configuration_parses_with_defaults() -> None:
     assert config.overflow is not None
     assert config.overflow.self_value == '["self-hosted","pve-ci"]'
     assert config.overflow.reroute_after_seconds == 120
+    assert config.overflow.reroute_discard_seconds == 0, "cutting jobs short is opt-in"
     assert config.daemon.poll_seconds == 15
     assert config.daemon.max_job_seconds == 23400
     assert str(config.network.network) == "192.168.100.0/24"
@@ -161,18 +162,19 @@ def test_overflow_values_must_be_runs_on_json(value: str) -> None:
         parse(data)
 
 
+@pytest.mark.parametrize("key", ["reroute_after_seconds", "reroute_discard_seconds"])
 @pytest.mark.parametrize(
     ("value", "valid"), [(0, True), (86400, True), (-1, False), (86401, False), ("2m", False)]
 )
-def test_the_reroute_wait_is_checked(value: object, valid: bool) -> None:
+def test_the_reroute_times_are_checked(key: str, value: object, valid: bool) -> None:
     data = config_data()
-    data["overflow"]["reroute_after_seconds"] = value
+    data["overflow"][key] = value
 
     if valid:
         overflow = parse(data).overflow
-        assert overflow is not None and overflow.reroute_after_seconds == value
+        assert overflow is not None and getattr(overflow, key) == value
     else:
-        with pytest.raises(ConfigError, match="reroute_after_seconds"):
+        with pytest.raises(ConfigError, match=key):
             parse(data)
 
 
