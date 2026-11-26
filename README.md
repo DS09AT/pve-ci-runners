@@ -247,10 +247,8 @@ Draining, a failed isolation probe and jobs waiting without disk room switch ove
 switch is logged with its reason, for example `overflow on: 1 slot free`.
 
 `capacity_variable` names a second repository variable, written for every `[overflow]` repository with
-the number of further jobs the `[overflow]` profile could start at once, and `0` while draining, a failed
-isolation probe or a full disk force overflow on. Unlike the free-slot trigger, it counts slots whose VM
-is being wrapped up, removed or cloned anew as free, because they are ready within about a minute; the
-profile's `max`, the memory budget, the host reserve and the disk reserve still bound it. It is
+the number of further jobs the `[overflow]` profile could start at once, the same number the free-slot
+trigger uses, and `0` while draining, a failed isolation probe or a full disk force overflow on. It is
 written when it changes, at most once per cycle, and reasserted like the overflow variable; a write is
 logged at DEBUG, a failed one at INFO. A workflow can then rank each job, here one that needs at least
 three free slots:
