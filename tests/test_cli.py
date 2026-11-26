@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -226,3 +227,21 @@ def test_a_failed_round_is_logged_and_does_not_stop_the_controller(
     cli._attach(Failing())  # type: ignore[arg-type]
 
     assert [r.getMessage().split("\n")[0] for r in caplog.records] == logged
+
+
+@pytest.mark.parametrize(("took", "warned"), [(3.0, False), (15.0, False), (15.5, True)])
+def test_the_cycle_duration_is_logged_and_a_slow_cycle_warned_about(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, took: float, warned: bool
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="pve_ci_runners")
+    clock = iter([100.0, 100.0 + took])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+
+    class Quick:
+        def cycle(self) -> None:
+            pass
+
+    cli._timed_cycle(Quick(), 15)  # type: ignore[arg-type]
+
+    assert f"cycle took {took:.1f} s" in caplog.text
+    assert any(r.levelno == logging.WARNING for r in caplog.records) is warned

@@ -484,7 +484,8 @@ def finish_job(setup, conclusion: str = "success") -> None:
     host.machines[121].done = True
     github.conclusions[42] = conclusion
     controller(*setup).cycle()
-    assert 121 not in host.machines
+    assert "destroy 121" in host.events
+    assert 121 not in host.machines or state(host, 121).phase == "booting", "a fresh VM may take the slot"
 
 
 def forge(host: FakeHost, **changes: object) -> None:
@@ -955,20 +956,22 @@ def test_a_long_cache_tidy_holds_up_neither_queued_jobs_nor_the_freed_slot(setup
     ctl.cycle()
     assert state(host, 122).phase == "assigned"
     assert state(host, 122).since - queued_at <= poll, "the warm VM takes a job while VM 121 tidies"
+    # The check queued in the previous cycle answered before the runner exited; this one reports the exit.
+    clock.now += poll
+    ctl.cycle()
     assert 121 in host.machines and cache.written == []
 
     background.run()
     clock.now += poll
     ctl.cycle()
     assert cache.written == [KEY], "the tidied cache of the trusted run is written back"
-    assert 121 not in host.machines
+    assert state(host, 121).phase == "booting", "the freed slot is cloned again in the same cycle"
     freed_at = clock.now
 
-    for _ in range(2):
-        clock.now += poll
-        ctl.cycle()
+    clock.now += poll
+    ctl.cycle()
     assert state(host, 121).phase == "assigned"
-    assert state(host, 121).since - freed_at <= 2 * poll
+    assert state(host, 121).since - freed_at <= poll
 
 
 def test_a_tidy_started_for_one_state_never_writes_back_another(setup) -> None:
@@ -1385,7 +1388,8 @@ def test_overflow_switches_on_while_a_slot_is_still_free_and_off_once_room_lasts
     github.conclusions[42] = "success"
     ctl.cycle()
     assert 121 not in host.machines
-    for _ in range(300 // config.daemon.poll_seconds):
+    # The slot is free from the cycle that removed its VM on, so the calm period starts there.
+    for _ in range(300 // config.daemon.poll_seconds - 1):
         clock.now += config.daemon.poll_seconds
         ctl.cycle()
         assert overflow_value(github) == HOSTED, "the pool must have room for a while first"
@@ -1502,3 +1506,61 @@ def test_without_a_capacity_variable_the_controller_writes_only_the_overflow_var
     controller(*setup).cycle()
 
     assert set(github.variables) == {("example-org/app", "CI_RUNS_ON")}
+
+
+def test_a_runner_that_has_not_exited_is_asked_again_at_once_so_every_cycle_reads_a_fresh_answer(
+    setup,
+) -> None:
+    _, host, _, _, _ = setup
+    ctl = started_job(setup)
+    background = Background()
+    ctl._lifecycle._checker = background
+    vm = state(host, 121)
+
+    assert ctl._lifecycle.poll_finished(121, vm) is None
+    background.run()
+    assert ctl._lifecycle.poll_finished(121, vm) is False
+    assert len(checks_of(background, 121)) == 1, "the next check is queued with the answer"
+
+    host.machines[121].done = True
+    background.run()
+    assert ctl._lifecycle.poll_finished(121, vm) is True
+
+
+def both_slots_running_jobs(setup) -> Controller:
+    _, host, github, _, _ = setup
+    ctl = started_job(setup)
+    ctl.cycle()
+    github.queue("example-org/app")
+    ctl.cycle()
+    assert [state(host, v).phase for v in (121, 122)] == ["assigned", "assigned"]
+    host.machines[121].done = True
+    github.conclusions[42] = "failure"
+    # The check queued in the previous cycle answered before the runner exited; this one reports the exit.
+    ctl.cycle()
+    return ctl
+
+
+def test_a_vm_removed_in_a_cycle_frees_its_slot_for_a_clone_in_the_same_cycle(setup) -> None:
+    _, host, github, _, _ = setup
+    ctl = both_slots_running_jobs(setup)
+    github.queue("example-org/app")
+    host.events.clear()
+
+    ctl.cycle()
+
+    assert host.events[:3] == ["destroy 121", "clone 121", "start 121"]
+
+
+def test_a_vm_removed_in_a_cycle_gives_its_memory_back_only_once(setup) -> None:
+    config, host, github, _, _ = setup
+    ctl = both_slots_running_jobs(setup)
+    github.queue("example-org/app")
+    # After the removal VM 122 alone is left, and one more VM would cross the host reserve by 1 MiB.
+    vm_mb = config.profiles[0].memory_mb
+    host.other_guests_mb = host.total_mb - config.capacity.host_reserve_mb - 2 * vm_mb + 1
+    host.events.clear()
+
+    ctl.cycle()
+
+    assert host.events == ["destroy 121"]

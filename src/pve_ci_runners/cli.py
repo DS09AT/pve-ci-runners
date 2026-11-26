@@ -166,7 +166,7 @@ def _run(args: argparse.Namespace) -> int:
         [p.name for p in loaded.profiles],
     )
     while True:
-        _cycle(controller)
+        _timed_cycle(controller, loaded.daemon.poll_seconds)
         deadline = time.monotonic() + loaded.daemon.poll_seconds
         while time.monotonic() < deadline:
             _attach(controller)
@@ -184,6 +184,16 @@ def _client(loaded: configuration.Config, commands: HostCommands) -> GitHubClien
         owner=loaded.github.owner,
         signer=AppKeySigner(commands, loaded.github.app_key_file),
     )
+
+
+def _timed_cycle(controller: Controller, poll_seconds: int) -> None:
+    started = time.monotonic()
+    _cycle(controller)
+    took = time.monotonic() - started
+    log.debug("cycle took %.1f s", took)
+    if took > poll_seconds:
+        # Every reaction to a finished job, a freed slot or a booted VM waits for the next cycle.
+        log.warning("cycle took %.1f s, longer than daemon.poll_seconds (%d s)", took, poll_seconds)
 
 
 def _cycle(controller: Controller) -> None:
