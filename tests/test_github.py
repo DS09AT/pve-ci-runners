@@ -1,5 +1,7 @@
 import datetime as dt
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -531,3 +533,33 @@ def test_the_conclusion_of_an_unfinished_run_is_unknown() -> None:
     })
 
     assert [Runs(api).run_conclusion("o/r", r) for r in (4, 5)] == [None, "unknown"]
+
+
+class SlowTransport(Transport):
+    """Takes a while for every answer, so concurrent requests really overlap."""
+
+    def send(self, method, url, headers, body):
+        time.sleep(0.02)
+        return super().send(method, url, headers, body)
+
+
+def test_concurrent_requests_share_one_token_and_keep_each_cached_answer() -> None:
+    paths = [f"/repos/o/r{i}/actions/runners" for i in range(8)]
+    answers = {("GET", p): [ok({"p": p}, etag=f'"{i}"'), Response(304, {}, b"")] for i, p in enumerate(paths)}
+    transport = SlowTransport({**AUTH, **answers})
+    api = GitHubClient(
+        api_url="https://api.github.com",
+        client_id="Iv23liEXAMPLE",
+        owner="example-org",
+        signer=Signer(),
+        transport=transport,
+        clock=lambda: 1_800_000_000.0,
+    )
+
+    with ThreadPoolExecutor(8) as pool:
+        first = list(pool.map(lambda p: api.get(p, conditional=True), paths))
+        again = list(pool.map(lambda p: api.get(p, conditional=True), paths))
+
+    tokens = [s for s in transport.sent if s[1] == "/app/installations/7/access_tokens"]
+    assert len(tokens) == 1, "the other requests wait for the one refresh"
+    assert first == again == [{"p": p} for p in paths], "each 304 returns its own path's answer"

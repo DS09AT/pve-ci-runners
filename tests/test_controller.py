@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import threading
+import time
 from concurrent.futures import wait
 from dataclasses import replace
 from pathlib import Path
@@ -1564,3 +1566,102 @@ def test_a_vm_removed_in_a_cycle_gives_its_memory_back_only_once(setup) -> None:
     ctl.cycle()
 
     assert host.events == ["destroy 121"]
+
+
+class SlowGitHub(FakeGitHub):
+    """Answers later the earlier a repository comes, and counts how many reads overlap."""
+
+    def __init__(self, repositories: list[str]) -> None:
+        super().__init__()
+        self.repos = dict.fromkeys(repositories, "main")
+        self.failing: set[str] = set()
+        self.active = 0
+        self.overlap = 0
+        self._lock = threading.Lock()
+
+    def _read(self, repository: str) -> None:
+        with self._lock:
+            self.active += 1
+            self.overlap = max(self.overlap, self.active)
+        time.sleep(0.01 * (len(self.repos) - list(self.repos).index(repository)))
+        with self._lock:
+            self.active -= 1
+        if repository in self.failing:
+            raise GitHubError(f"{repository} answered 502", 502)
+
+    def queued_jobs(self, repository: str) -> list[QueuedJob]:
+        self._read(repository)
+        return super().queued_jobs(repository)
+
+    def busy_runners(self, repository: str) -> frozenset[str]:
+        self._read(repository)
+        return frozenset({f"{repository}-busy"})
+
+
+REPOS = [f"example-org/app{i}" for i in range(6)]
+
+
+def test_repositories_are_read_at_once_and_the_demand_equals_a_serial_read(setup) -> None:
+    config, host, _, cache, clock = setup
+    github = SlowGitHub(REPOS)
+    for count, repository in enumerate(REPOS, start=1):
+        github.queue(repository, count=count)
+    ctl = Controller(config, host, github, cache, disk=host, overflow=None, clock=clock)
+
+    demand = ctl._demand(github.repositories(), clock.now)
+
+    assert github.overlap > 1, "the reads overlap"
+    assert list(demand.jobs) == REPOS, "the order is that of the repositories, not of the answers"
+    assert demand.queued["default"] == {r: n for n, r in enumerate(REPOS, start=1)}
+    assert demand.jobs == {r: github.queued_jobs(r) for r in REPOS}
+
+
+def test_a_repository_that_fails_to_answer_leaves_the_others_unchanged(setup, caplog) -> None:
+    config, host, _, cache, clock = setup
+    github = SlowGitHub(REPOS)
+    for repository in REPOS:
+        github.queue(repository)
+    github.failing = {REPOS[2]}
+    ctl = Controller(config, host, github, cache, disk=host, overflow=None, clock=clock)
+
+    demand = ctl._demand(github.repositories(), clock.now)
+    busy = ctl._busy(set(REPOS))
+
+    assert list(demand.jobs) == [r for r in REPOS if r != REPOS[2]]
+    assert busy == {f"{r}-busy" for r in REPOS if r != REPOS[2]}
+    assert f"{REPOS[2]}: queued jobs unknown: {REPOS[2]} answered 502" in caplog.text
+    assert f"{REPOS[2]}: busy runners unknown: {REPOS[2]} answered 502" in caplog.text
+
+
+def test_an_unexpected_error_of_one_read_still_fails_the_cycle(setup) -> None:
+    config, host, _, cache, clock = setup
+
+    class Broken(SlowGitHub):
+        def queued_jobs(self, repository: str) -> list[QueuedJob]:
+            raise KeyError(repository)
+
+    github = Broken(REPOS)
+    ctl = Controller(config, host, github, cache, disk=host, overflow=None, clock=clock)
+
+    with pytest.raises(KeyError):
+        ctl._demand(github.repositories(), clock.now)
+
+
+def test_every_cycle_logs_how_long_each_phase_took(setup, caplog) -> None:
+    caplog.set_level(logging.DEBUG, logger="pve_ci_runners")
+
+    controller(*setup).cycle()
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("cycle phases: "))
+    phases = [part.split(" ")[0] for part in line.removeprefix("cycle phases: ").split(", ")]
+    assert phases == [
+        "states",
+        "advance",
+        "demand",
+        "busy",
+        "plan",
+        "reroute",
+        "apply",
+        "overflow",
+        "maintenance",
+    ]

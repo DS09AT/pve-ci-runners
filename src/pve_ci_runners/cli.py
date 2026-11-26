@@ -27,6 +27,7 @@ from pve_ci_runners.teardown import Teardown
 from pve_ci_runners.template_build import TemplateBuilder
 
 _ATTACH_INTERVAL = 2.0
+_SLOW_CYCLE_WARNING_INTERVAL = 600
 log = logging.getLogger("pve_ci_runners")
 
 
@@ -165,8 +166,9 @@ def _run(args: argparse.Namespace) -> int:
         len(loaded.slots),
         [p.name for p in loaded.profiles],
     )
+    timer = _CycleTimer(loaded.daemon.poll_seconds)
     while True:
-        _timed_cycle(controller, loaded.daemon.poll_seconds)
+        timer.run(controller)
         deadline = time.monotonic() + loaded.daemon.poll_seconds
         while time.monotonic() < deadline:
             _attach(controller)
@@ -186,14 +188,30 @@ def _client(loaded: configuration.Config, commands: HostCommands) -> GitHubClien
     )
 
 
-def _timed_cycle(controller: Controller, poll_seconds: int) -> None:
-    started = time.monotonic()
-    _cycle(controller)
-    took = time.monotonic() - started
-    log.debug("cycle took %.1f s", took)
-    if took > poll_seconds:
+class _CycleTimer:
+    """Runs cycles and logs how long each took; a slow one is warned about at most every ten minutes."""
+
+    def __init__(self, poll_seconds: int) -> None:
+        self._poll_seconds = poll_seconds
+        self._warned_at = -float(_SLOW_CYCLE_WARNING_INTERVAL)
+
+    def run(self, controller: Controller) -> None:
+        """One cycle, timed."""
+        started = time.monotonic()
+        _cycle(controller)
+        ended = time.monotonic()
+        took = ended - started
+        log.debug("cycle took %.1f s", took)
         # Every reaction to a finished job, a freed slot or a booted VM waits for the next cycle.
-        log.warning("cycle took %.1f s, longer than daemon.poll_seconds (%d s)", took, poll_seconds)
+        if took > self._poll_seconds and ended - self._warned_at >= _SLOW_CYCLE_WARNING_INTERVAL:
+            self._warned_at = ended
+            phases = f": {controller.phases}" if controller.phases else ""
+            log.warning(
+                "cycle took %.1f s, longer than daemon.poll_seconds (%d s)%s",
+                took,
+                self._poll_seconds,
+                phases,
+            )
 
 
 def _cycle(controller: Controller) -> None:
