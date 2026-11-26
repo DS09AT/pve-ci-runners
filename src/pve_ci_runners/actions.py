@@ -115,14 +115,19 @@ class Actions:
         """Every queued job of the repository's workflow runs that are not finished yet."""
         jobs: list[QueuedJob] = []
         seen: set[int] = set()
-        for status in _UNFINISHED_RUNS:
+        # The status-filtered listings can lag behind a run's status for minutes, so the newest runs are
+        # also read unfiltered and their status is checked here.
+        for status in (*_UNFINISHED_RUNS, ""):
+            query = f"status={status}&" if status else ""
             runs = _obj(
                 self._api.get(
-                    f"/repos/{repository}/actions/runs?status={status}&per_page={_RUNS_PAGE}",
-                    conditional=True,
+                    f"/repos/{repository}/actions/runs?{query}per_page={_RUNS_PAGE}", conditional=True
                 )
             )
-            for run in _objs(runs.get("workflow_runs")):
+            listed = _objs(runs.get("workflow_runs"))
+            if not status:
+                listed = [run for run in listed if run.get("status") in _UNFINISHED_RUNS]
+            for run in listed:
                 run_id = _int(run.get("id"))
                 if run_id not in seen:
                     seen.add(run_id)
