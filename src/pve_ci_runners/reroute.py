@@ -39,8 +39,8 @@ class RunControl(Protocol):
         """The run as GitHub shows it right now."""
         ...
 
-    def cancel(self, repository: str, run_id: int) -> None:
-        """Cancels the run."""
+    def cancel(self, repository: str, run_id: int) -> str | None:
+        """Cancels the run and returns None, or returns why it is left alone."""
         ...
 
     def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
@@ -126,9 +126,12 @@ class Reroute:
             if not self._qualifies(run, self._clock()):
                 log.info("%s run %s not rerouted: it no longer qualifies", stalled.repository, run_id)
                 return 0
-            self._control.cancel(stalled.repository, run_id)
+            refusal = self._control.cancel(stalled.repository, run_id)
         except GitHubError as err:
             self._refused(err, f"{stalled.repository} run {run_id} not cancelled")
+            return 0
+        if refusal is not None:
+            log.info("%s run %s not rerouted: %s", stalled.repository, run_id, refusal)
             return 0
         strict = run.event != "pull_request"
         self._cancelled[run_id] = replace(stalled, discarded=len(run.running), strict=strict)

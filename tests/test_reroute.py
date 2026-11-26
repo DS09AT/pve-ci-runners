@@ -27,6 +27,7 @@ class Control:
         self.fail: dict[str, GitHubError] = {}
         self.fresh: dict[int, RunSummary] = {}
         self.refusals: dict[int, str] = {}
+        self.superseded: set[int] = set()
         self.strict: dict[int, bool] = {}
 
     def summary(self, repository: str, run_id: int) -> RunSummary:
@@ -34,9 +35,12 @@ class Control:
             raise self.fail["summary"]
         return self.fresh.get(run_id, UNSTARTED)
 
-    def cancel(self, repository: str, run_id: int) -> None:
+    def cancel(self, repository: str, run_id: int) -> str | None:
+        if run_id in self.superseded:
+            return f"run {run_id + 1} superseded it"
         self._call("cancel", run_id)
         self.conclusions.setdefault(run_id, "cancelled")
+        return None
 
     def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
         self.strict[run_id] = strict
@@ -296,6 +300,19 @@ def test_a_superseded_run_is_not_re_run(caplog) -> None:
 
     assert control.calls == [("cancel", 7)]
     assert [r.getMessage() for r in caplog.records] == [f"{REPO} run 7 not re-run: run 9 superseded it"]
+
+
+def test_a_superseded_run_is_not_even_cancelled(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    control = Control()
+    control.superseded.add(7)
+    rr = reroute(control)
+
+    rr.update({REPO: [job(7), job(8)]}, NOW)
+    rr.update({REPO: [job(7)]}, NOW + 15)
+
+    assert control.calls == [("cancel", 8), ("rerun", 8)]
+    assert f"{REPO} run 7 not rerouted: run 8 superseded it" in caplog.text
 
 
 def test_zero_turns_rerouting_off() -> None:

@@ -13,6 +13,8 @@ from pve_ci_runners.state import COMMIT, VerifiedJob
 _PAGE = 100
 _RUNS_PAGE = 50
 _HTTP_NOT_FOUND = 404
+# Conclusions a re-run of failed jobs leaves alone.
+_SETTLED = frozenset({"success", "skipped", "neutral"})
 
 
 class Api(Protocol):
@@ -39,10 +41,10 @@ class Api(Protocol):
 class RunSummary:
     """What deciding a reroute needs to know about the latest attempt of a run."""
 
-    # The run is in its first attempt and GitHub lists all of its jobs.
+    # GitHub lists all of the run's jobs.
     complete: bool
     event: str
-    # No job was picked up by a runner and none finished other than skipped.
+    # No job of the latest attempt was picked up by a runner and none finished other than skipped.
     unstarted: bool
     # When each job a runner holds right now started; a time GitHub does not report counts as the epoch.
     running: tuple[float, ...] = ()
@@ -234,9 +236,17 @@ class Runs:
         run = _obj(self._api.get(f"/repos/{repository}/actions/runs/{run_id}"))
         return _summary(run, _jobs_page(self._api, repository, run_id, conditional=False))
 
-    def cancel(self, repository: str, run_id: int) -> None:
-        """Cancels every job of the run that has not finished."""
+    def cancel(self, repository: str, run_id: int) -> str | None:
+        """Cancels every job of the run that has not finished and returns None, or returns why not.
+
+        A newer run of the same workflow and branch makes this one a deliberate re-run of an older commit,
+        whose re-run would be refused anyway; cancelling it would only end it.
+        """
+        newer = self._newer_run(repository, run_id)
+        if newer is not None:
+            return f"run {newer} superseded it"
         self._api.post(f"/repos/{repository}/actions/runs/{run_id}/cancel", {})
+        return None
 
     def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
         """Re-runs the run's cancelled and failed jobs and returns None, or returns why that is unsafe.
@@ -298,10 +308,10 @@ def _listed_in_full(answer: dict[str, object]) -> bool:
 
 
 def _summary(run: dict[str, object], answer: dict[str, object]) -> RunSummary:
-    jobs = _objs(answer.get("jobs"))
+    jobs = _current_jobs(answer)
     held = [j for j in jobs if j.get("status") != "completed" and _started(j)]
     return RunSummary(
-        complete=run.get("run_attempt") == 1 and _listed_in_full(answer),
+        complete=_listed_in_full(answer),
         event=_str(run.get("event")),
         unstarted=not any(_started(job) for job in jobs),
         running=tuple(_start(job) for job in held),
@@ -318,9 +328,27 @@ def _start(job: dict[str, object]) -> float:
 def _rerun_refusal(answer: dict[str, object], *, strict: bool) -> str | None:
     if not _listed_in_full(answer):
         return "GitHub does not list all of its jobs"
-    if strict and any(_ran(job) for job in _objs(answer.get("jobs"))):
+    if strict and any(_ran(job) for job in _current_jobs(answer)):
         return "a job of it ran after all"
     return None
+
+
+def _current_jobs(answer: dict[str, object]) -> list[dict[str, object]]:
+    """The jobs of the latest attempt, and those of earlier ones a re-run of failed jobs would run again.
+
+    A re-run lists the jobs it carried over with the attempt they ran in. Those that succeeded or were
+    skipped stay as they are, so they neither block nor count as work a cancellation would lose; a failed
+    or cancelled one would run again, so it counts as started. A job without an attempt number counts as
+    current.
+    """
+    jobs = _objs(answer.get("jobs"))
+    latest = max((a for j in jobs if isinstance(a := _attempt(j), int)), default=0)
+    return [j for j in jobs if (_attempt(j) or latest) >= latest or j.get("conclusion") not in _SETTLED]
+
+
+def _attempt(job: dict[str, object]) -> int | None:
+    value = job.get("run_attempt")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _ran(job: dict[str, object]) -> bool:

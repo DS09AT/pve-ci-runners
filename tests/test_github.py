@@ -435,19 +435,86 @@ def test_a_pull_request_reports_when_each_job_a_runner_holds_started() -> None:
 def test_a_cancellation_posts_to_the_run() -> None:
     api = runs_api({"total_count": 0, "jobs": []})
 
-    Runs(api).cancel("o/r", 3)
-
+    assert Runs(api).cancel("o/r", 3) is None
     assert api.writes == [("POST", "/repos/o/r/actions/runs/3/cancel", {})]
 
 
-@pytest.mark.parametrize(("total", "attempt"), [(3, 1), (None, 1), (True, 1), (2, 2), (2, None)], ids=str)
-def test_a_run_with_unlisted_jobs_or_a_later_attempt_is_never_unstarted(
-    total: object, attempt: object
-) -> None:
-    api = runs_api({"total_count": total, "jobs": [QUEUED, QUEUED]}, attempt=attempt)
+@pytest.mark.parametrize("total", [3, None, True], ids=str)
+def test_a_run_with_unlisted_jobs_is_never_complete(total: object) -> None:
+    api = runs_api({"total_count": total, "jobs": [QUEUED, QUEUED]})
 
     run = Actions(api).queued_jobs("o/r")[0].run
     assert run is not None and not run.complete
+
+
+def attempt(job: dict, number: int) -> dict:
+    return job | {"run_attempt": number}
+
+
+SUCCEEDED = {
+    "status": "completed",
+    "conclusion": "success",
+    "runner_name": "ci-runner-121-abc",
+    "started_at": "2026-01-01T00:00:00Z",
+    "steps": [{"name": "Set up job"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("earlier", "current", "unstarted"),
+    [
+        (SUCCEEDED, QUEUED, True),
+        ({**SUCCEEDED, "conclusion": "skipped", "runner_name": None, "steps": []}, QUEUED, True),
+        (SUCCEEDED | {"conclusion": "failure"}, QUEUED, False),
+        (SUCCEEDED, {"status": "in_progress", "runner_name": "ci-runner-122-abc"}, False),
+        (QUEUED, SUCCEEDED, False),
+    ],
+    ids=["succeeded before", "skipped before", "failed before", "running now", "ran now"],
+)
+def test_a_re_run_attempt_counts_only_the_jobs_a_re_run_of_failed_jobs_would_run(
+    earlier: dict, current: dict, unstarted: bool
+) -> None:
+    jobs = {"total_count": 3, "jobs": [attempt(earlier, 1), attempt(current, 2), attempt(QUEUED, 2)]}
+    api = runs_api(jobs, attempt=2)
+
+    run = Actions(api).queued_jobs("o/r")[0].run
+
+    assert run is not None and run.complete and run.unstarted is unstarted
+
+
+def test_a_re_run_attempt_is_re_run_although_its_carried_over_jobs_ran() -> None:
+    cancelled = {"status": "completed", "conclusion": "cancelled", "steps": []}
+    api = runs_api({"total_count": 2, "jobs": [attempt(SUCCEEDED, 1), attempt(cancelled, 2)]}, attempt=2)
+
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) is None
+    assert api.writes == [("POST", "/repos/o/r/actions/runs/3/rerun-failed-jobs", {})]
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_a_carried_over_job_that_failed_after_it_ran_refuses_a_strict_re_run(conclusion: str) -> None:
+    # Re-running failed jobs would run it again, for example a deploy, although nobody asked for it.
+    failed = attempt(SUCCEEDED | {"conclusion": conclusion}, 1)
+    api = runs_api({"total_count": 2, "jobs": [failed, attempt(QUEUED, 2)]}, attempt=2)
+
+    run = Actions(api).queued_jobs("o/r")[0].run
+
+    assert run is not None and run.unstarted is False
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) == "a job of it ran after all"
+    assert api.writes == []
+
+
+def test_a_superseded_run_is_not_cancelled() -> None:
+    api = runs_api({"total_count": 0, "jobs": []})
+    api.gets[NEWER] = {"workflow_runs": [{"id": 8, "created_at": "2026-01-01T00:05:00Z"}]}
+
+    assert Runs(api).cancel("o/r", 3) == "run 8 superseded it"
+    assert api.writes == []
+
+
+def test_a_job_of_the_re_run_attempt_that_ran_still_refuses_a_strict_re_run() -> None:
+    api = runs_api({"total_count": 2, "jobs": [attempt(QUEUED, 1), attempt(SUCCEEDED, 2)]}, attempt=2)
+
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) == "a job of it ran after all"
 
 
 @pytest.mark.parametrize(
