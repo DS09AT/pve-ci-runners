@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 
 import pytest
 
@@ -181,3 +182,57 @@ def test_zero_and_minus_one_are_valid_and_keep_the_hysteresis_rule() -> None:
     config = parse(data).overflow
 
     assert config is not None and (config.on_backlog, config.on_free_slots) == (0, -1)
+
+
+def capacity_writes(writer: Writer) -> list[str]:
+    return [value for _, name, value in writer.writes if name == "KB_FREE_SLOTS"]
+
+
+def test_without_a_capacity_variable_only_the_overflow_variable_is_written(overflow_config) -> None:
+    writer = Writer()
+
+    Overflow(overflow_config, writer).update(unserved=0, oldest_wait=0, free=4, now=1000)
+
+    assert {name for _, name, _ in writer.writes} == {"CI_RUNS_ON"}
+
+
+def test_the_free_capacity_is_published_on_change_and_reasserted(overflow_config, caplog) -> None:
+    caplog.set_level(logging.DEBUG)
+    writer = Writer()
+    overflow = Overflow(dataclasses.replace(overflow_config, capacity_variable="KB_FREE_SLOTS"), writer)
+
+    lines = overflow.update(unserved=0, oldest_wait=0, free=4, now=1000)
+    overflow.update(unserved=0, oldest_wait=0, free=4, now=1015)
+    overflow.update(unserved=0, oldest_wait=0, free=3, now=1030)
+    overflow.update(unserved=0, oldest_wait=0, free=3, now=1030 + REASSERT_SECONDS)
+
+    assert capacity_writes(writer) == ["4", "3", "3"]
+    assert not any("KB_FREE_SLOTS" in line for line in lines), "a successful write is no INFO line"
+    assert "example-org/app: KB_FREE_SLOTS = 4" in caplog.text
+
+
+def test_the_published_capacity_is_zero_while_overflow_is_forced_on(overflow_config) -> None:
+    writer = Writer()
+    overflow = Overflow(dataclasses.replace(overflow_config, capacity_variable="KB_FREE_SLOTS"), writer)
+
+    overflow.update(unserved=0, oldest_wait=0, free=4, now=1000, forced=True)
+
+    assert capacity_writes(writer) == ["0"]
+
+
+def test_a_failed_capacity_write_is_reported_and_retried(overflow_config) -> None:
+    class Refusing(Writer):
+        def set_variable(self, repository: str, name: str, value: str) -> None:
+            if name == "KB_FREE_SLOTS" and self.fail:
+                raise GitHubError("forbidden", 403)
+            self.writes.append((repository, name, value))
+
+    writer = Refusing(fail=True)
+    overflow = Overflow(dataclasses.replace(overflow_config, capacity_variable="KB_FREE_SLOTS"), writer)
+
+    lines = overflow.update(unserved=0, oldest_wait=0, free=4, now=1000)
+    writer.fail = False
+    overflow.update(unserved=0, oldest_wait=0, free=4, now=1015)
+
+    assert "example-org/app: KB_FREE_SLOTS not updated: forbidden" in lines
+    assert capacity_writes(writer) == ["4"]

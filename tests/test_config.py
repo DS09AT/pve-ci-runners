@@ -18,6 +18,7 @@ def test_the_base_configuration_parses_with_defaults() -> None:
     assert config.overflow.self_value == '["self-hosted","pve-ci"]'
     assert config.overflow.reroute_after_seconds == 120
     assert config.overflow.reroute_discard_seconds == 0, "cutting jobs short is opt-in"
+    assert not config.overflow.capacity_variable
     assert config.daemon.poll_seconds == 15
     assert config.daemon.max_job_seconds == 23400
     assert str(config.network.network) == "192.168.100.0/24"
@@ -176,6 +177,29 @@ def test_the_reroute_times_are_checked(key: str, value: object, valid: bool) -> 
     else:
         with pytest.raises(ConfigError, match=key):
             parse(data)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("kb_free_slots", "does not match"), ("1SLOTS", "does not match"), ("CI_RUNS_ON", "must differ")],
+)
+def test_the_capacity_variable_is_a_valid_name_other_than_the_overflow_variable(
+    value: str, message: str
+) -> None:
+    data = config_data()
+    data["overflow"]["capacity_variable"] = value
+
+    with pytest.raises(ConfigError, match=f"capacity_variable: .*{message}"):
+        parse(data)
+
+
+def test_a_capacity_variable_is_accepted() -> None:
+    data = config_data()
+    data["overflow"]["capacity_variable"] = "KB_FREE_SLOTS"
+
+    overflow = parse(data).overflow
+
+    assert overflow is not None and overflow.capacity_variable == "KB_FREE_SLOTS"
 
 
 def test_overflow_names_an_existing_profile() -> None:

@@ -177,6 +177,7 @@ class OverflowConfig:
     off_seconds: int
     reroute_after_seconds: int
     reroute_discard_seconds: int
+    capacity_variable: str = ""
 
 
 @dataclass(frozen=True)
@@ -494,13 +495,20 @@ def _overflow(s: Section | None, profiles: tuple[Profile, ...]) -> OverflowConfi
         # GitHub fails a job that waited a day for a runner, so a longer wait never reroutes anything.
         reroute_after_seconds=s.number("reroute_after_seconds", default=120, minimum=0, maximum=86400),
         reroute_discard_seconds=s.number("reroute_discard_seconds", default=0, minimum=0, maximum=86400),
+        capacity_variable=s.text("capacity_variable", default="", pattern=f"(?:{VARIABLE})?"),
     )
     s.done()
+    _check_overflow(s, result)
+    return result
+
+
+def _check_overflow(s: Section, result: OverflowConfig) -> None:
     if result.off_free_slots <= result.on_free_slots:
         raise s.error("off_free_slots", "must exceed on_free_slots")
+    if result.capacity_variable == result.variable:
+        raise s.error("capacity_variable", "must differ from variable")
     for key, value in (("self_value", result.self_value), ("hosted_value", result.hosted_value)):
         _require_runs_on_json(s, key, value)
-    return result
 
 
 def _require_runs_on_json(s: Section, key: str, value: str) -> None:
