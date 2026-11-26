@@ -273,6 +273,7 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
         "/repos/o/r/actions/runs?status=waiting&per_page=50": {"workflow_runs": []},
         "/repos/o/r/actions/runs?status=requested&per_page=50": {"workflow_runs": []},
         "/repos/o/r/actions/runs?status=in_progress&per_page=50": {"workflow_runs": [{"id": 9}]},
+        "/repos/o/r/actions/runs?per_page=50": {"workflow_runs": [{"id": 9, "status": "in_progress"}]},
         "/repos/o/r/actions/runs/9/jobs?filter=latest&per_page=100": jobs,
         "/repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100": {
             "total_count": 1,
@@ -380,6 +381,7 @@ def runs_api(jobs: dict[str, object], *, attempt: object = 1, event: str = "push
     gets["/repos/o/r/actions/runs?status=queued&per_page=50"] = {
         "workflow_runs": [{"id": 3, "run_attempt": attempt, "event": event}]
     }
+    gets["/repos/o/r/actions/runs?per_page=50"] = {"workflow_runs": []}
     gets["/repos/o/r/actions/runs/3/jobs?filter=latest&per_page=100"] = jobs
     gets["/repos/o/r/actions/runs/3"] = {
         "status": "completed",
@@ -630,3 +632,23 @@ def test_concurrent_requests_share_one_token_and_keep_each_cached_answer() -> No
     tokens = [s for s in transport.sent if s[1] == "/app/installations/7/access_tokens"]
     assert len(tokens) == 1, "the other requests wait for the one refresh"
     assert first == again == [{"p": p} for p in paths], "each 304 returns its own path's answer"
+
+
+def test_a_run_the_status_listings_miss_is_found_in_the_unfiltered_one_and_counted_once() -> None:
+    api = runs_api({"total_count": 1, "jobs": [QUEUED]})
+    api.gets["/repos/o/r/actions/runs/5/jobs?filter=latest&per_page=100"] = {
+        "total_count": 1,
+        "jobs": [QUEUED],
+    }
+    api.gets["/repos/o/r/actions/runs?per_page=50"] = {
+        "workflow_runs": [
+            {"id": 3, "status": "queued", "run_attempt": 1},
+            {"id": 5, "status": "queued", "run_attempt": 1},
+            {"id": 6, "status": "completed", "run_attempt": 1},
+        ]
+    }
+
+    queued = Actions(api).queued_jobs("o/r")
+
+    assert [job.run_id for job in queued] == [3, 5], "run 3 once, run 5 although no status listing has it"
+    assert "/repos/o/r/actions/runs/6/jobs?filter=latest&per_page=100" not in api.conditional
