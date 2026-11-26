@@ -7,7 +7,7 @@ import collections
 import logging
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -84,6 +84,8 @@ class Controller:
         self._failures: dict[int, int] = {}
         self._disk_room = 0
         self._reader: Executor = ThreadPoolExecutor(_READERS, thread_name_prefix="github")
+        # Each slot's steps touch only its own VM, clone and runner, so the slots advance side by side.
+        self._slot_work: Executor = ThreadPoolExecutor(len(config.slots), thread_name_prefix="slot")
         self.blocked: str | None = None
         # How long each phase of the last completed cycle took, for the operator's slow-cycle warning.
         self.phases = ""
@@ -167,12 +169,18 @@ class Controller:
         self._failures = {
             v: n for v, n in self._failures.items() if v in states and states[v].phase != "booting"
         }
-        result: dict[int, VmState] = {}
-        for vmid, state in states.items():
-            kept = self._advance_guarded(vmid, state, repositories, now)
-            if kept is not None:
-                result[vmid] = kept
-        return result
+        steps = {v: partial(self._advance_guarded, v, s, repositories, now) for v, s in states.items()}
+        outcomes = self._each(list(steps.values()))
+        return {vmid: kept for vmid, kept in zip(steps, outcomes, strict=True) if kept is not None}
+
+    def _each[T](self, actions: list[Callable[[], T]]) -> list[T]:
+        """Runs one action per slot at once and returns their results once all of them ended.
+
+        Waiting for every action before an error surfaces keeps a failed cycle from overlapping the next.
+        """
+        futures = [self._slot_work.submit(action) for action in actions]
+        wait(futures)
+        return [future.result() for future in futures]
 
     def _advance_guarded(
         self, vmid: int, state: VmState, repositories: dict[str, str], now: float
@@ -402,20 +410,25 @@ class Controller:
         )
 
     def _apply(self, plans: dict[str, Plan], states: dict[int, VmState], infos: dict[int, VmInfo]) -> None:
-        for plan in plans.values():
-            self._retire_and_assign(plan, states)
+        self._each([action for plan in plans.values() for action in self._retire_and_assign(plan, states)])
         creations = [(name, vmid) for name, plan in plans.items() for vmid in plan.create]
         template = self._template(infos) if creations else None
         if template is not None:
             self._create(creations, template, infos)
 
-    def _retire_and_assign(self, plan: Plan, states: dict[int, VmState]) -> None:
+    def _retire_and_assign(self, plan: Plan, states: dict[int, VmState]) -> list[Callable[[], bool]]:
+        """The plan's retirements and assignments, one action per slot."""
+        actions: list[Callable[[], bool]] = []
         for vmid in plan.retire:
             if vmid in plan.stuck:
                 log.warning("VM %s is retired: its runner took no job within the assign timeout", vmid)
-            _guarded(vmid, partial(self._lifecycle.retire, vmid, states[vmid], self._repositories))
+            retire = partial(self._lifecycle.retire, vmid, states[vmid], self._repositories)
+            actions.append(partial(_guarded, vmid, retire))
         for vmid, repository in plan.assign:
-            _guarded(vmid, partial(self._lifecycle.assign, vmid, states[vmid], repository))
+            actions.append(
+                partial(_guarded, vmid, partial(self._lifecycle.assign, vmid, states[vmid], repository))
+            )
+        return actions
 
     def _template(self, infos: dict[int, VmInfo]) -> int | None:
         template = current_template(self._config.template.vmids, infos, self._description)
@@ -426,21 +439,40 @@ class Controller:
 
     def _create(self, creations: list[tuple[str, int]], template: int, infos: dict[int, VmInfo]) -> None:
         with memory_lock(self._config.daemon.state_dir):
-            host = self._pve.host_memory(reserved_build_vms(self._config))
-            budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
-            committed = host.committed_mb
-            for name, vmid in creations:
-                profile = self._config.profile(name)
-                if self._fits(HostMemory(host.total_mb, committed), budget_left, profile) < 1:
-                    log.info("not starting VM %s: the host keeps its reserve for other guests", vmid)
-                    return
-                if self._disk_room < 1:
-                    log.warning("not starting VM %s: the disk keeps the write reserve of every VM", vmid)
-                    return
-                if _guarded(vmid, partial(self._lifecycle.create, self._slots[vmid], profile, template)):
-                    budget_left -= profile.memory_mb
-                    committed += profile.memory_mb
-                    self._disk_room -= 1
+            cloned = self._clone_admitted(creations, template, infos)
+            # Each clone carries its memory size already, so the starts under the same lock run side by side.
+            self._each([partial(_guarded, s.vmid, partial(self._boot, s, p)) for s, p in cloned])
+
+    def _boot(self, slot: Slot, profile: Profile) -> None:
+        self._pve.start(slot.vmid)
+        log.info("booting %s for profile %s", self._lifecycle.name(slot.vmid), profile.name)
+
+    def _clone_admitted(
+        self, creations: list[tuple[str, int]], template: int, infos: dict[int, VmInfo]
+    ) -> list[tuple[Slot, Profile]]:
+        """Clones the VMs memory and disk admit, one after another.
+
+        Proxmox allocates linked clones under a lock of the storage that holds the template, so parallel
+        clones would only queue there, and could run into its lock timeout.
+        """
+        host = self._pve.host_memory(reserved_build_vms(self._config))
+        budget_left = self._config.capacity.memory_mb - self._runner_memory(infos)
+        committed = host.committed_mb
+        cloned: list[tuple[Slot, Profile]] = []
+        for name, vmid in creations:
+            profile = self._config.profile(name)
+            if self._fits(HostMemory(host.total_mb, committed), budget_left, profile) < 1:
+                log.info("not starting VM %s: the host keeps its reserve for other guests", vmid)
+                break
+            if self._disk_room < 1:
+                log.warning("not starting VM %s: the disk keeps the write reserve of every VM", vmid)
+                break
+            if _guarded(vmid, partial(self._lifecycle.clone, self._slots[vmid], profile, template)):
+                budget_left -= profile.memory_mb
+                committed += profile.memory_mb
+                self._disk_room -= 1
+                cloned.append((self._slots[vmid], profile))
+        return cloned
 
     def _update_overflow(self, plans: dict[str, Plan], demand: _Demand, now: float) -> None:
         if self._overflow is None:

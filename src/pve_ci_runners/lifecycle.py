@@ -64,8 +64,8 @@ class Lifecycle:
         pattern = re.escape(self.name(vmid)) + f"-[0-9a-f]{{{_RUNNER_SUFFIX}}}"
         return state.runner is None or re.fullmatch(pattern, state.runner) is not None
 
-    def create(self, slot: Slot, profile: Profile, template: int) -> None:
-        """Clones the template, locks the VM down and boots it."""
+    def clone(self, slot: Slot, profile: Profile, template: int) -> None:
+        """Clones the template and locks the VM down; from here on its memory counts on the host."""
         rules = render(slot, self._config.firewall, self._pve.host_networks())
         self._pve.clone(template, slot.vmid, self.name(slot.vmid))
         # The clone inherited the template's firewall file; the slot's own rules replace it before boot.
@@ -76,8 +76,6 @@ class Lifecycle:
         self._pve.configure(slot.vmid, self._vm_options(profile, state))
         if profile.disk_limits:
             self._pve.limit_disk(slot.vmid, "scsi0", profile.disk_limits)
-        self._pve.start(slot.vmid)
-        log.info("booting %s for profile %s", self.name(slot.vmid), profile.name)
 
     def warm_up(self, slot: Slot, state: VmState) -> VmState | None:
         """Configures a booted VM and proves its isolation; None while the guest agent is not up yet."""

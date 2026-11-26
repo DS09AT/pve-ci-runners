@@ -16,11 +16,12 @@ from pve_ci_runners.config import Config, parse
 from pve_ci_runners.controller import Controller, profile_for
 from pve_ci_runners.drain import drain, reserve
 from pve_ci_runners.errors import CommandError, GitHubError, GuestError
+from pve_ci_runners.guest import payload_version
 from pve_ci_runners.lifecycle import Lifecycle
 from pve_ci_runners.overflow import Overflow
 from pve_ci_runners.pve import TAG
 from pve_ci_runners.reroute import Reroute
-from pve_ci_runners.state import VerifiedJob, decode
+from pve_ci_runners.state import VerifiedJob, VmState, decode
 from tests.conftest import config_data
 from tests.fakes import HEAD, Background, FakeCache, FakeGitHub, FakeHost, FakeVm, holds_memory_lock
 
@@ -1665,3 +1666,140 @@ def test_every_cycle_logs_how_long_each_phase_took(setup, caplog) -> None:
         "overflow",
         "maintenance",
     ]
+
+
+class Overlapping:
+    """Counts how many calls of one kind run at the same time."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[str, int] = {}
+        self.peak: dict[str, int] = {}
+
+    def around(self, kind: str, call):
+        with self._lock:
+            self._active[kind] = self._active.get(kind, 0) + 1
+            self.peak[kind] = max(self.peak.get(kind, 0), self._active[kind])
+        try:
+            time.sleep(0.02)
+            return call()
+        finally:
+            with self._lock:
+                self._active[kind] -= 1
+
+
+class SlowHost(FakeHost):
+    """A host whose guest calls, clones and starts take a while, and that records their overlap."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.overlap = Overlapping()
+        self.broken: set[int] = set()
+        self.locked_starts: list[bool] = []
+        self.state_dir: Path | None = None
+
+    def guest(self, vmid: int, text: str, *, stdin: str | None = None, timeout: int = 120) -> str:
+        if vmid in self.broken:
+            raise GuestError(f"VM {vmid}: guest agent not running")
+        return self.overlap.around("guest", lambda: super(SlowHost, self).guest(vmid, text, stdin=stdin))
+
+    def clone(self, template: int, vmid: int, name: str) -> None:
+        self.overlap.around("clone", lambda: super(SlowHost, self).clone(template, vmid, name))
+
+    def start(self, vmid: int) -> None:
+        assert self.state_dir is not None
+        self.locked_starts.append(holds_memory_lock(self.state_dir))
+        self.overlap.around("start", lambda: super(SlowHost, self).start(vmid))
+
+
+def four_slots(tmp_path: Path) -> Config:
+    data = config_data(
+        daemon={"state_dir": str(tmp_path / "state"), "log_dir": str(tmp_path / "logs")},
+        capacity={"memory_mb": 4 * 5120, "host_reserve_mb": 4096},
+    )
+    data["slot"] = [{"vmid": 121 + i, "address": f"192.168.100.{21 + i}"} for i in range(4)]
+    data["profile"][0] |= {"max": 4, "warm": 4}
+    return parse(data)
+
+
+def mixed_slots(host: FakeHost) -> None:
+    """A finished job, a booted VM, a VM still booting and a warm VM, one in each slot."""
+    base = VmState(phase="booting", since=1000, profile="default", payload=payload_version())
+    phases = {
+        121: base.evolve(phase="assigned", repository="example-org/app", runner="ci-runner-121-abcdef"),
+        122: base,
+        123: base,
+        124: base.evolve(phase="warm"),
+    }
+    for vmid, vm_state in phases.items():
+        host.machines[vmid] = FakeVm(
+            name=f"ci-runner-{vmid}", running=True, tags={TAG}, description=vm_state.encode()
+        )
+        host.firewall[vmid] = "rules"
+    host.machines[121].done = True
+    host.machines[123].agent = False
+
+
+def advanced(tmp_path: Path, *, serial: bool) -> tuple[dict[int, str], set[str], SlowHost]:
+    config = four_slots(tmp_path)
+    host = SlowHost()
+    host.add_template(9201)
+    mixed_slots(host)
+    clock = Clock(1010.0)
+    ctl = Controller(config, host, FakeGitHub(), FakeCache(), disk=host, overflow=None, clock=clock)
+    ctl._lifecycle._checker = Background(inline=True)
+    if serial:
+        ctl._slot_work = Background(inline=True)
+    states = ctl._advance(ctl._states(host.vms()), {"example-org/app": "main"}, clock.now)
+    return {v: s.phase for v, s in states.items()}, set(host.events), host
+
+
+def test_slots_advance_side_by_side_to_the_same_states_as_one_after_another(tmp_path: Path) -> None:
+    serial = advanced(tmp_path / "serial", serial=True)
+    parallel = advanced(tmp_path / "parallel", serial=False)
+
+    assert parallel[:2] == serial[:2]
+    assert parallel[0] == {122: "warm", 123: "booting", 124: "warm"}
+    assert parallel[1] == {"destroy 121"}
+    assert serial[2].overlap.peak["guest"] == 1
+    assert parallel[2].overlap.peak["guest"] > 1, "the guest calls of different slots overlap"
+
+
+def test_a_slot_whose_guest_fails_keeps_its_state_and_leaves_the_others_unchanged(
+    tmp_path: Path, caplog
+) -> None:
+    config = four_slots(tmp_path)
+    host = SlowHost()
+    host.add_template(9201)
+    mixed_slots(host)
+    host.broken = {122}
+    clock = Clock(1010.0)
+    ctl = Controller(config, host, FakeGitHub(), FakeCache(), disk=host, overflow=None, clock=clock)
+    ctl._lifecycle._checker = Background(inline=True)
+
+    states = ctl._advance(ctl._states(host.vms()), {"example-org/app": "main"}, clock.now)
+
+    assert {v: s.phase for v, s in states.items()} == {122: "booting", 123: "booting", 124: "warm"}
+    assert "destroy 121" in host.events
+    assert "VM 122: VM 122: guest agent not running" in caplog.text
+
+
+def test_new_vms_are_cloned_one_by_one_started_side_by_side_and_only_as_far_as_memory_admits(
+    tmp_path: Path,
+) -> None:
+    config = four_slots(tmp_path)
+    vm_mb = config.profiles[0].memory_mb
+    # Three VMs fit, the fourth would cross the host reserve.
+    host = SlowHost(total_mb=24000 + config.capacity.host_reserve_mb + 3 * vm_mb + 1)
+    host.state_dir = config.daemon.state_dir
+    host.add_template(9201)
+    clock = Clock()
+    ctl = Controller(config, host, FakeGitHub(), FakeCache(), disk=host, overflow=None, clock=clock)
+
+    ctl.cycle()
+
+    assert sorted(v for v in host.machines if v != 9201) == [121, 122, 123]
+    assert host.overlap.peak["clone"] == 1, "clones of the template queue on its storage anyway"
+    assert host.overlap.peak["start"] > 1, "the starts overlap"
+    assert host.locked_starts == [True, True, True], "every start runs under the memory lock"
+    assert all(e.split()[0] == "clone" for e in host.events[:3]), "admitted and cloned before any start"
