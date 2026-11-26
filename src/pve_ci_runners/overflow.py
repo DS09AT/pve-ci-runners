@@ -92,19 +92,9 @@ class Overflow:
         return written is not None and written[0] == self._config.hosted_value
 
     def update(
-        self,
-        *,
-        unserved: int,
-        oldest_wait: float,
-        free: int,
-        now: float,
-        forced: bool = False,
-        capacity: int | None = None,
+        self, *, unserved: int, oldest_wait: float, free: int, now: float, forced: bool = False
     ) -> list[str]:
-        """Applies the decision; returns one log line per switch, per write and per failed write.
-
-        `capacity` is what the capacity variable publishes when it differs from `free`.
-        """
+        """Applies the decision; returns one log line per switch, per write and per failed write."""
         before = self._state.on
         self._state = (
             Hysteresis(on=True)
@@ -125,7 +115,7 @@ class Overflow:
         value = self._config.hosted_value if self._state.on else self._config.self_value
         lines.extend(line for _, line in self._write_all(self._config.variable, value, now))
         if self._config.capacity_variable:
-            lines.extend(self._publish_capacity(free if capacity is None else capacity, now, forced=forced))
+            lines.extend(self._publish_capacity(free, now, forced=forced))
         return lines
 
     def _publish_capacity(self, free: int, now: float, *, forced: bool) -> list[str]:
