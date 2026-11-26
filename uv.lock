@@ -368,7 +368,7 @@ wheels = [
 
 [[package]]
 name = "pve-ci-runners"
-version = "0.10.6"
+version = "0.10.7"
 source = { editable = "." }
 
 [package.dev-dependencies]

@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.10.7](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.6...v0.10.7) (2026-11-26)
+
+
+### Bug Fixes
+
+* see runs that the status-filtered listing omits ([f0980d5](https://github.com/DS09AT/pve-ci-runners/commit/f0980d579ed709b307e607602d396c22f72b505c))
+
 ## [0.10.6](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.5...v0.10.6) (2026-11-26)
 
 
