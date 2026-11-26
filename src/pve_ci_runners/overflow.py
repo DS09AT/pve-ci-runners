@@ -6,8 +6,12 @@ directly is never redirected. GitHub reads `vars` once, when a workflow run is c
 run keeps the value of that moment, even one queued long after a switch. Overflow therefore switches on
 while the pool still has room, before a run created now could lock onto busy slots, and off only after
 the pool has had room for a while; the hysteresis keeps the variable from flapping between polls.
+
+With `capacity_variable`, a second variable carries the number of further jobs the pool could start at
+once, so a workflow can send each job to the pool only above a threshold of its own.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,6 +21,7 @@ from pve_ci_runners.errors import GitHubError
 # Another controller or a manual edit can overwrite the variable; an unchanged value is written again
 # after this long, so such a change lasts one interval at most.
 REASSERT_SECONDS = 600
+log = logging.getLogger("pve_ci_runners")
 
 
 class VariableWriter(Protocol):
@@ -74,7 +79,7 @@ class Overflow:
         self._config = config
         self._writer = writer
         self._state = Hysteresis()
-        self._written: dict[str, tuple[str, float]] = {}
+        self._written: dict[tuple[str, str], tuple[str, float]] = {}
 
     @property
     def on(self) -> bool:
@@ -83,7 +88,7 @@ class Overflow:
 
     def hosted(self, repository: str) -> bool:
         """Whether the repository's variable was last written with the hosted value."""
-        written = self._written.get(repository)
+        written = self._written.get((repository, self._config.variable))
         return written is not None and written[0] == self._config.hosted_value
 
     def update(
@@ -108,26 +113,43 @@ class Overflow:
             reason = trigger(unserved=unserved, oldest_wait=oldest_wait, free=free, config=self._config)
             lines.append(self._switched(reason="no VM can start" if forced else reason, free=free))
         value = self._config.hosted_value if self._state.on else self._config.self_value
-        lines.extend(
-            self._write(repository, value, now)
-            for repository in self._config.repositories
-            if not self._current(repository, value, now)
-        )
+        lines.extend(line for _, line in self._write_all(self._config.variable, value, now))
+        if self._config.capacity_variable:
+            lines.extend(self._publish_capacity(free, now, forced=forced))
         return lines
+
+    def _publish_capacity(self, free: int, now: float, *, forced: bool) -> list[str]:
+        """Writes the free capacity; it changes often, so only a failed write is worth a line."""
+        # Zero while forced on sends every rank to the hosted runner, because no VM can start.
+        capacity = str(0 if forced else max(0, free))
+        lines: list[str] = []
+        for written, line in self._write_all(self._config.capacity_variable, capacity, now):
+            if written:
+                log.debug("%s", line)
+            else:
+                lines.append(line)
+        return lines
+
+    def _write_all(self, variable: str, value: str, now: float) -> list[tuple[bool, str]]:
+        return [
+            self._write(repository, variable, value, now)
+            for repository in self._config.repositories
+            if not self._current(repository, variable, value, now)
+        ]
 
     def _switched(self, *, reason: str | None, free: int) -> str:
         if self._state.on:
             return f"overflow on: {reason}"
         return f"overflow off: {free} slots free and nothing unserved for {self._config.off_seconds} s"
 
-    def _current(self, repository: str, value: str, now: float) -> bool:
-        written = self._written.get(repository)
+    def _current(self, repository: str, variable: str, value: str, now: float) -> bool:
+        written = self._written.get((repository, variable))
         return written is not None and written[0] == value and now - written[1] < REASSERT_SECONDS
 
-    def _write(self, repository: str, value: str, now: float) -> str:
+    def _write(self, repository: str, variable: str, value: str, now: float) -> tuple[bool, str]:
         try:
-            self._writer.set_variable(repository, self._config.variable, value)
+            self._writer.set_variable(repository, variable, value)
         except GitHubError as err:
-            return f"{repository}: {self._config.variable} not updated: {err}"
-        self._written[repository] = (value, now)
-        return f"{repository}: {self._config.variable} = {value}"
+            return False, f"{repository}: {variable} not updated: {err}"
+        self._written[repository, variable] = (value, now)
+        return True, f"{repository}: {variable} = {value}"

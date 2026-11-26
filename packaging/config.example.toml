@@ -70,6 +70,7 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 #                                      # (-1 = never)
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
+# capacity_variable = "KB_FREE_SLOTS"  # optional: also publish how many more jobs the pool takes now
 # reroute_after_seconds = 120          # cancel and re-run a run whose job waited this long; 0 = off
 # reroute_discard_seconds = 0          # opt-in, if pull_request CI never deploys or publishes: redo
 #                                      # its jobs running at most this long

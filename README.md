@@ -174,6 +174,7 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 #                                      # (-1 = never)
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
+# capacity_variable = "KB_FREE_SLOTS"  # optional: also publish how many more jobs the pool takes now
 # reroute_after_seconds = 120          # cancel and re-run a run whose job waited this long; 0 = off
 # reroute_discard_seconds = 0          # opt-in, if pull_request CI never deploys or publishes: redo
 #                                      # its jobs running at most this long
@@ -241,8 +242,26 @@ while capacity hovers around one threshold. Both thresholds are at most the prof
 `on_backlog = 0` turns the backlog trigger off and `on_free_slots = -1` the free-capacity trigger. To pay
 for hosted minutes only once a job has really waited, set both and let `on_wait_seconds` alone switch
 overflow on, with `reroute_after_seconds` equal to it so the jobs that waited move to the hosted runner.
+
 Draining, a failed isolation probe and jobs waiting without disk room switch overflow on regardless. Each
 switch is logged with its reason, for example `overflow on: 1 slot free`.
+
+`capacity_variable` names a second repository variable, written for every `[overflow]` repository with
+the number of further jobs the `[overflow]` profile could start at once, the same number the free-slot
+trigger uses, and `0` while draining, a failed isolation probe or a full disk force overflow on. It is
+written when it changes, at most once per cycle, and reasserted like the overflow variable; a write is
+logged at DEBUG, a failed one at INFO. A workflow can then rank each job, here one that needs at least
+three free slots:
+
+```yaml
+runs-on: ${{ fromJSON(vars.KB_FREE_SLOTS || '0') >= 3 && fromJSON('["self-hosted","pve-ci"]') || 'ubuntu-latest' }}
+```
+
+Give the lowest ranks to the longest jobs, so they keep the pool while short ones go hosted first. The
+fallback `|| '0'` sends a job to the hosted runner while the variable does not exist, which is the safe
+side. GitHub reads the variable when a run is created, so runs created within the same poll interval see
+the same number and may together take more slots than it promised; their surplus waits and, with
+reroute, moves on. The capacity variable complements `variable`: each repository may use either.
 
 A burst that arrives while the pool is idle still binds all its jobs to the pool before overflow switches
 on. While the variable points at the hosted runner and the `[overflow]` profile has unserved jobs, a run

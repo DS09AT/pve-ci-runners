@@ -1478,3 +1478,27 @@ def test_without_reroute_the_controller_cancels_nothing(setup) -> None:
     controller(*setup).cycle()
 
     assert overflow_value(github) == HOSTED and github.cancelled == []
+
+
+def test_the_capacity_variable_carries_the_spare_slots_and_zero_while_no_vm_can_start(setup) -> None:
+    config, host, github, cache, clock = setup
+    assert config.overflow is not None
+    config = replace(config, overflow=replace(config.overflow, capacity_variable="KB_FREE_SLOTS"))
+
+    ctl = controller(config, host, github, cache, clock)
+    ctl.cycle()
+    assert github.variables[("example-org/app", "KB_FREE_SLOTS")] == "2", "a booting VM and a free slot"
+
+    host.disk_bytes = 0
+    github.queue("example-org/app")
+    clock.now += 15
+    ctl.cycle()
+    assert github.variables[("example-org/app", "KB_FREE_SLOTS")] == "0"
+
+
+def test_without_a_capacity_variable_the_controller_writes_only_the_overflow_variable(setup) -> None:
+    _, _, github, _, _ = setup
+
+    controller(*setup).cycle()
+
+    assert set(github.variables) == {("example-org/app", "CI_RUNS_ON")}
