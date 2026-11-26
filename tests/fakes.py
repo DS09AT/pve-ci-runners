@@ -275,9 +275,10 @@ class FakeGitHub:
     def summary(self, repository: str, run_id: int) -> RunSummary:
         return next(j.run for j in self.queued.get(repository, []) if j.run_id == run_id and j.run)
 
-    def cancel(self, repository: str, run_id: int) -> None:
+    def cancel(self, repository: str, run_id: int) -> str | None:
         self.cancelled.append(run_id)
         self.queued[repository] = [j for j in self.queued.get(repository, []) if j.run_id != run_id]
+        return None
 
     def rerun_safely(self, repository: str, run_id: int, *, strict: bool) -> str | None:
         self.reruns.append(run_id)

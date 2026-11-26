@@ -274,11 +274,14 @@ opt-in, because the default `reroute_discard_seconds = 0` reroutes only runs wit
 it only for repositories whose `pull_request` workflows neither deploy nor publish: the rule holds on the
 assumption that pull request CI does not deploy or publish; leave `reroute_discard_seconds` at 0
 otherwise. `push`, `release` and every other event keep the rule that no started job is cancelled, and
-their re-run is refused if a job ran after all. Only first attempts whose
-jobs GitHub lists in full are considered, a repository with a runner that is assigned but has not
-started a job is skipped, and the run is read again right before the cancellation. Cancelling starts the
-run's jobs with `if: always()` or `if: cancelled()`. A newer run of the same workflow and branch refuses
-the re-run, which is then logged as a warning. Each run is cancelled at most once per controller lifetime
+their re-run is refused if a job ran after all. Re-run attempts, for example after "Re-run failed jobs"
+while overflow was off, are rerouted too; jobs they carried over count only if a re-run of failed jobs
+would run them again, so the ones that succeeded or were skipped are left out. Only runs whose jobs GitHub
+lists in full are considered, a repository with a runner that is assigned but has not started a job is
+skipped, and the run is read again right before the cancellation. Cancelling starts the run's jobs with
+`if: always()` or `if: cancelled()`. A newer run of the same workflow and branch leaves a run alone, so a
+deliberate re-run of an older commit is never cancelled, and refuses a re-run, which is then logged as a
+warning. Each run is cancelled at most once per controller lifetime
 and at most five per cycle, and each re-run is logged as
 `rerouted <repository> run <id>: <n> jobs waited <s> s, discarded <k> running jobs`. A re-run attempt
 shows the App as its triggering actor. Reroute needs the App permission Actions: Read and write; without
