@@ -481,10 +481,12 @@ def _overflow(s: Section | None, profiles: tuple[Profile, ...]) -> OverflowConfi
         ),
         hosted_value=s.text("hosted_value"),
         repositories=s.texts("repositories", pattern=REPOSITORY, minimum=1),
-        on_backlog=s.number("on_backlog", default=2, minimum=1),
+        on_backlog=s.number("on_backlog", default=2, minimum=0),
         on_wait_seconds=s.number("on_wait_seconds", default=120, minimum=0),
         # The profile never holds more than `max` VMs, so a larger threshold would never switch off.
-        on_free_slots=s.number("on_free_slots", default=min(1, chosen.maximum - 1), maximum=chosen.maximum),
+        on_free_slots=s.number(
+            "on_free_slots", default=min(1, chosen.maximum - 1), minimum=-1, maximum=chosen.maximum
+        ),
         off_free_slots=s.number(
             "off_free_slots", default=min(3, chosen.maximum), minimum=1, maximum=chosen.maximum
         ),

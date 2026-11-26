@@ -4,7 +4,7 @@ import pytest
 
 from pve_ci_runners.config import parse
 from pve_ci_runners.errors import GitHubError
-from pve_ci_runners.overflow import REASSERT_SECONDS, Hysteresis, Overflow, decide
+from pve_ci_runners.overflow import REASSERT_SECONDS, Hysteresis, Overflow, decide, trigger
 from tests.conftest import config_data
 from tests.fakes import FakeGitHub
 
@@ -154,3 +154,30 @@ def test_the_switch_names_its_reason(overflow_config, unserved, oldest_wait, fre
     lines = overflow.update(unserved=unserved, oldest_wait=oldest_wait, free=free, now=1000)
 
     assert lines[0] == f"overflow on: {reason}"
+
+
+@pytest.mark.parametrize("unserved", [0, 1, 50])
+@pytest.mark.parametrize("free", [0, 1, 5])
+def test_disabled_backlog_and_free_slot_triggers_never_fire_but_the_wait_does(
+    overflow_config, unserved: int, free: int
+) -> None:
+    config = dataclasses.replace(overflow_config, on_backlog=0, on_free_slots=-1)
+
+    assert trigger(unserved=unserved, oldest_wait=119, free=free, config=config) is None
+    assert trigger(unserved=unserved, oldest_wait=120, free=free, config=config) == "a job waits for 120 s"
+
+
+def test_each_trigger_turns_off_on_its_own(overflow_config) -> None:
+    no_backlog = dataclasses.replace(overflow_config, on_backlog=0)
+    no_free = dataclasses.replace(overflow_config, on_free_slots=-1)
+
+    assert trigger(unserved=9, oldest_wait=0, free=0, config=no_backlog) == "0 slots free"
+    assert trigger(unserved=9, oldest_wait=0, free=0, config=no_free) == "9 jobs without a VM"
+
+
+def test_zero_and_minus_one_are_valid_and_keep_the_hysteresis_rule() -> None:
+    data = config_data()
+    data["overflow"] |= {"on_backlog": 0, "on_free_slots": -1, "off_free_slots": 1}
+    config = parse(data).overflow
+
+    assert config is not None and (config.on_backlog, config.on_free_slots) == (0, -1)

@@ -168,9 +168,10 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # self_value = '["self-hosted", "pve-ci"]'
 # hosted_value = '"ubuntu-latest"'
 # repositories = ["example-org/app"]
-# on_backlog = 2                       # switch on once this many jobs have no VM,
+# on_backlog = 2                       # switch on once this many jobs have no VM (0 = never),
 # on_wait_seconds = 120                # once a job has waited this long,
 # on_free_slots = 1                    # or once the profile could start no more than this many jobs
+#                                      # (-1 = never)
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
 # reroute_after_seconds = 120          # cancel and re-run a run whose job waited this long; 0 = off
@@ -237,6 +238,9 @@ budget, the host reserve and the disk reserve still allow. It switches off only 
 and at least `off_free_slots` stayed free for `off_seconds` without a break, so the variable does not flap
 while capacity hovers around one threshold. Both thresholds are at most the profile's `max`, and
 `off_free_slots` must exceed `on_free_slots`; by default they are 1 and 3, lowered to fit a smaller `max`.
+`on_backlog = 0` turns the backlog trigger off and `on_free_slots = -1` the free-capacity trigger. To pay
+for hosted minutes only once a job has really waited, set both and let `on_wait_seconds` alone switch
+overflow on, with `reroute_after_seconds` equal to it so the jobs that waited move to the hosted runner.
 Draining, a failed isolation probe and jobs waiting without disk room switch overflow on regardless. Each
 switch is logged with its reason, for example `overflow on: 1 slot free`.
 

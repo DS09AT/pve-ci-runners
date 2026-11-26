@@ -36,12 +36,16 @@ class Hysteresis:
 
 
 def trigger(*, unserved: int, oldest_wait: float, free: int, config: OverflowConfig) -> str | None:
-    """Why the pool needs the hosted runner now, or None while it copes on its own."""
-    if unserved >= config.on_backlog:
+    """Why the pool needs the hosted runner now, or None while it copes on its own.
+
+    `on_backlog = 0` and `on_free_slots = -1` turn their trigger off, so only a real wait costs hosted
+    minutes.
+    """
+    if config.on_backlog and unserved >= config.on_backlog:
         return f"{unserved} jobs without a VM"
     if oldest_wait >= config.on_wait_seconds:
         return f"a job waits for {oldest_wait:.0f} s"
-    if free <= config.on_free_slots:
+    if config.on_free_slots >= 0 and free <= config.on_free_slots:
         return f"{free} slot{'' if free == 1 else 's'} free"
     return None
 
