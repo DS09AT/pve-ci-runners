@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.10.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.9.0...v0.10.0) (2026-11-26)
+
+
+### Features
+
+* publish the free capacity for per-job routing ([86cfd73](https://github.com/DS09AT/pve-ci-runners/commit/86cfd738c862deaa144979db198c433393e83808))
+
 ## [0.9.0](https://github.com/DS09AT/pve-ci-runners/compare/v0.8.0...v0.9.0) (2026-11-26)
 
 
