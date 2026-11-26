@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -825,3 +826,26 @@ def test_a_write_back_finished_by_maintenance_is_what_the_next_lease_clones(
         cache.lease("o__r/ci__build", 122, runner=RUNNER, run_id=2)
         assert any(c[:2] == ["zfs", "clone"] and f"{golden}@g6" in c for c in script.calls)
         assert not any(c[:2] == ["zfs", "create"] and golden in c for c in script.calls)
+
+
+def test_write_backs_and_drops_of_finishing_slots_never_overlap(config: Config, monkeypatch) -> None:
+    cache = zfs_cache(config, Script())
+    active = [0]
+    peak = [0]
+
+    def step(*_args, **_kwargs) -> bool:
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        time.sleep(0.02)
+        active[0] -= 1
+        return True
+
+    monkeypatch.setattr(cache, "_write_back", step)
+    monkeypatch.setattr(cache, "_owned", step)
+    lease = CacheLease("example-org/app/k", "rpool/ci-cache/jobs/x-121-1", "rpool/ci-cache/repos/k@g1")
+    with ThreadPoolExecutor(4) as pool:
+        for vmid in range(4):
+            pool.submit(cache.write_back, lease, vmid, runner=RUNNER, run_id=1)
+            pool.submit(cache.drop, lease, vmid)
+
+    assert peak[0] == 1, "two write-backs of one key would both pass the origin check"

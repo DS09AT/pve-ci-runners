@@ -11,6 +11,7 @@ clone is written back for another runner or run than the one it was created for.
 
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -51,6 +52,8 @@ class ZfsCache:
         self._device_exists = device_exists
         self.repos = f"{config.dataset}/repos"
         self.jobs = f"{config.dataset}/jobs"
+        # Slots finish at the same time; two write-backs of one key must not both pass the origin check.
+        self._lock = threading.Lock()
 
     def lease(self, key: str, vmid: int, *, runner: str, run_id: int) -> Attachment | None:
         """A clone of the newest snapshot of the key's golden volume, created empty on first use.
@@ -85,6 +88,10 @@ class ZfsCache:
 
         The marker property lets `maintain` finish the four steps if the controller stops between them.
         """
+        with self._lock:
+            return self._write_back(lease, vmid, runner=runner, run_id=run_id)
+
+    def _write_back(self, lease: CacheLease, vmid: int, *, runner: str, run_id: int) -> bool:
         golden = f"{self.repos}/{lease.key}"
         identity = self._identity(lease, vmid)
         if identity is None or self._snapshots(golden)[-1:] != [lease.origin]:
@@ -103,8 +110,9 @@ class ZfsCache:
 
     def drop(self, lease: CacheLease, vmid: int) -> None:
         """Destroys the job's clone and its snapshots."""
-        if self._owned(lease, vmid):
-            self._commands.run(["zfs", "destroy", "-r", lease.clone], timeout=300)
+        with self._lock:
+            if self._owned(lease, vmid):
+                self._commands.run(["zfs", "destroy", "-r", lease.clone], timeout=300)
 
     def maintain(self, in_use: set[str]) -> list[str]:
         """Finishes interrupted write-backs, removes orphans and expired caches, then frees the dataset.
