@@ -69,4 +69,6 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # on_free_slots = 1                    # or once the profile could start no more than this many jobs
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
-# reroute_after_seconds = 120          # re-run a run whose jobs waited this long, none started; 0 = off
+# reroute_after_seconds = 120          # cancel and re-run a run whose job waited this long; 0 = off
+# reroute_discard_seconds = 0          # opt-in, if pull_request CI never deploys or publishes: redo
+#                                      # its jobs running at most this long

@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 
 import pytest
@@ -300,7 +301,10 @@ def test_queued_jobs_and_verification_come_from_the_api() -> None:
     assert [sorted(j.labels) for j in queued] == [["pve-ci", "self-hosted"]] * 2, (
         "a job of a pending run is found, and a run listed under two statuses counts once"
     )
-    assert [(j.run_id, j.run_unstarted) for j in queued] == [(9, False), (7, True)]
+    assert [(j.run_id, j.run and j.run.complete and j.run.unstarted) for j in queued] == [
+        (9, False),
+        (7, True),
+    ]
     verified = actions.verify("o/r", 9, "ci-runner-121-abc", running=True)
     assert verified is not None and verified.job == "build" and verified.same_repository
     assert verified.head_sha == "a" * 40
@@ -366,18 +370,20 @@ def test_an_unknown_runner_lookup_deletes_nothing() -> None:
         Actions(failing).remove_runner("o/r", "ci-runner-121-abc")
 
 
-def runs_api(jobs: dict[str, object], *, attempt: object = 1) -> Api:
+def runs_api(jobs: dict[str, object], *, attempt: object = 1, event: str = "push") -> Api:
     gets: dict[str, object] = {
         f"/repos/o/r/actions/runs?status={s}&per_page=50": {"workflow_runs": []}
         for s in ("pending", "waiting", "requested", "in_progress")
     }
     gets["/repos/o/r/actions/runs?status=queued&per_page=50"] = {
-        "workflow_runs": [{"id": 3, "run_attempt": attempt}]
+        "workflow_runs": [{"id": 3, "run_attempt": attempt, "event": event}]
     }
     gets["/repos/o/r/actions/runs/3/jobs?filter=latest&per_page=100"] = jobs
     gets["/repos/o/r/actions/runs/3"] = {
         "status": "completed",
         "conclusion": "cancelled",
+        "run_attempt": attempt,
+        "event": event,
         "workflow_id": 11,
         "head_branch": "release/1.x",
         "created_at": "2026-01-01T00:00:00Z",
@@ -406,10 +412,30 @@ QUEUED = {"status": "queued", "labels": [], "created_at": "2026-01-01T00:00:00Z"
 def test_a_run_counts_as_unstarted_only_while_no_job_did_work(other: dict, unstarted: bool) -> None:
     api = runs_api({"total_count": 2, "jobs": [QUEUED, other]})
 
-    assert Actions(api).queued_jobs("o/r")[0].run_unstarted is unstarted
-    assert Runs(api).cancel_unstarted("o/r", 3) is unstarted
+    run = Actions(api).queued_jobs("o/r")[0].run
+    assert run is not None and run.complete and run.unstarted is unstarted
+    assert Runs(api).summary("o/r", 3) == run
     assert api.conditional[JOBS] is False, "the check right before the cancellation is never served stale"
-    assert api.writes == ([("POST", "/repos/o/r/actions/runs/3/cancel", {})] if unstarted else [])
+
+
+def test_a_pull_request_reports_when_each_job_a_runner_holds_started() -> None:
+    held = {"status": "in_progress", "runner_name": "a", "started_at": "2026-01-01T00:01:00Z"}
+    picked = {"status": "queued", "runner_name": "b"}
+    done = {"status": "completed", "conclusion": "success", "runner_name": "c"}
+    api = runs_api({"total_count": 4, "jobs": [QUEUED, held, picked, done]}, event="pull_request")
+
+    run = Runs(api).summary("o/r", 3)
+
+    assert run.event == "pull_request" and not run.unstarted
+    assert run.running == (dt.datetime(2026, 1, 1, 0, 1, tzinfo=dt.UTC).timestamp(), 0.0)
+
+
+def test_a_cancellation_posts_to_the_run() -> None:
+    api = runs_api({"total_count": 0, "jobs": []})
+
+    Runs(api).cancel("o/r", 3)
+
+    assert api.writes == [("POST", "/repos/o/r/actions/runs/3/cancel", {})]
 
 
 @pytest.mark.parametrize(("total", "attempt"), [(3, 1), (None, 1), (True, 1), (2, 2), (2, None)], ids=str)
@@ -418,13 +444,12 @@ def test_a_run_with_unlisted_jobs_or_a_later_attempt_is_never_unstarted(
 ) -> None:
     api = runs_api({"total_count": total, "jobs": [QUEUED, QUEUED]}, attempt=attempt)
 
-    assert Actions(api).queued_jobs("o/r")[0].run_unstarted is False
-    if attempt == 1:
-        assert Runs(api).cancel_unstarted("o/r", 3) is False and api.writes == []
+    run = Actions(api).queued_jobs("o/r")[0].run
+    assert run is not None and not run.complete
 
 
 @pytest.mark.parametrize(
-    ("job", "rerun"),
+    ("job", "strict", "rerun"),
     [
         (
             {
@@ -434,21 +459,24 @@ def test_a_run_with_unlisted_jobs_or_a_later_attempt_is_never_unstarted(
                 "steps": [],
             },
             True,
+            True,
         ),
-        ({"status": "completed", "conclusion": "cancelled", "runner_name": "ci-runner-121-abc"}, False),
+        ({"status": "completed", "conclusion": "cancelled", "runner_name": "ci-runner-121-abc"}, True, False),
+        ({"status": "completed", "conclusion": "cancelled", "runner_name": "ci-runner-121-abc"}, False, True),
         (
             {"status": "completed", "started_at": "2026-01-01T00:00:00Z", "steps": [{"name": "Set up job"}]},
+            True,
             False,
         ),
     ],
 )
-def test_a_cancelled_run_is_re_run_only_if_none_of_its_jobs_ran(job: dict, rerun: bool) -> None:
+def test_a_cancelled_run_is_re_run_only_if_none_of_its_jobs_ran(job: dict, strict: bool, rerun: bool) -> None:
     api = runs_api({"total_count": 1, "jobs": [job]})
     runs = Runs(api)
 
     assert runs.run_conclusion("o/r", 3) == "cancelled"
-    assert (runs.rerun_safely("o/r", 3) is None) is rerun
-    assert api.writes == ([("POST", "/repos/o/r/actions/runs/3/rerun", {})] if rerun else [])
+    assert (runs.rerun_safely("o/r", 3, strict=strict) is None) is rerun
+    assert api.writes == ([("POST", "/repos/o/r/actions/runs/3/rerun-failed-jobs", {})] if rerun else [])
     assert api.conditional[JOBS] is False
 
 
@@ -456,7 +484,7 @@ def test_a_run_with_more_jobs_than_listed_is_not_re_run() -> None:
     untouched = {"status": "completed", "conclusion": "cancelled", "steps": []}
     api = runs_api({"total_count": 101, "jobs": [untouched] * 100})
 
-    assert Runs(api).rerun_safely("o/r", 3) == "GitHub does not list all of its jobs"
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) == "GitHub does not list all of its jobs"
     assert api.writes == []
 
 
@@ -470,7 +498,7 @@ def test_a_run_a_newer_run_of_its_workflow_and_branch_superseded_is_not_re_run()
         ]
     }
 
-    assert Runs(api).rerun_safely("o/r", 3) == "run 8 superseded it"
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) == "run 8 superseded it"
     assert api.writes == []
 
 
@@ -483,7 +511,7 @@ def test_a_run_superseded_within_the_same_second_is_not_re_run() -> None:
         ]
     }
 
-    assert Runs(api).rerun_safely("o/r", 3) == "run 4 superseded it"
+    assert Runs(api).rerun_safely("o/r", 3, strict=True) == "run 4 superseded it"
     assert api.writes == []
 
 
@@ -492,7 +520,7 @@ def test_a_run_without_a_branch_is_never_re_run() -> None:
     api.gets["/repos/o/r/actions/runs/3"] = {"workflow_id": 11, "head_branch": None}
 
     with pytest.raises(GitHubError, match="without a branch"):
-        Runs(api).rerun_safely("o/r", 3)
+        Runs(api).rerun_safely("o/r", 3, strict=True)
     assert api.writes == []
 
 

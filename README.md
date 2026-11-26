@@ -173,7 +173,9 @@ image_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # on_free_slots = 1                    # or once the profile could start no more than this many jobs
 # off_free_slots = 3                   # switch off only while nothing waits and this many are free
 # off_seconds = 300                    # without a break for this long
-# reroute_after_seconds = 120          # re-run a run whose jobs waited this long, none started; 0 = off
+# reroute_after_seconds = 120          # cancel and re-run a run whose job waited this long; 0 = off
+# reroute_discard_seconds = 0          # opt-in, if pull_request CI never deploys or publishes: redo
+#                                      # its jobs running at most this long
 ```
 
 `pve-ci-runners config check` validates the file and exits; it is safe to use as a configuration
@@ -240,18 +242,25 @@ switch is logged with its reason, for example `overflow on: 1 slot free`.
 
 A burst that arrives while the pool is idle still binds all its jobs to the pool before overflow switches
 on. While the variable points at the hosted runner and the `[overflow]` profile has unserved jobs, a run
-whose job has waited `reroute_after_seconds` for the `self_value` labels and of which no runner has picked
-up a job yet is cancelled and, once GitHub recorded the cancellation, re-run; the new attempt reads the
-variable again. Only first attempts whose jobs GitHub lists in full are considered, a repository with a
-runner that is assigned but has not started a job is skipped, and the jobs are read again right before
-the cancellation. Cancelling still starts the run's jobs with `if: always()` or `if: cancelled()`; if any
-job of the cancelled attempt ran, or a newer run of the same workflow and branch exists, the run is not
-re-run and a warning is logged. Each run is cancelled at
-most once per controller lifetime and at most five per cycle, and each re-run is logged as
-`rerouted <repository> run <id>: <n> jobs waited <s> s`. A re-run attempt shows the App as its triggering
-actor. Reroute needs the App permission Actions: Read and write; without it the controller logs one
-warning and stops rerouting until it restarts, and `pve-ci-runners doctor` fails its
-`reroute permission` check. Set `reroute_after_seconds = 0` to turn it off.
+whose job has waited `reroute_after_seconds` for the `self_value` labels is cancelled and, once GitHub
+recorded the cancellation, its cancelled and failed jobs are re-run with `rerun-failed-jobs`; the new
+attempt reads the variable again, and finished jobs stay as they are. A run qualifies when no runner has
+picked up a job of it yet. A `pull_request` run also qualifies when every job a runner holds started at
+most `reroute_discard_seconds` ago; those jobs are cut short and run again on the hosted runner. This is
+opt-in, because the default `reroute_discard_seconds = 0` reroutes only runs without a started job. Set
+it only for repositories whose `pull_request` workflows neither deploy nor publish: the rule holds on the
+assumption that pull request CI does not deploy or publish; leave `reroute_discard_seconds` at 0
+otherwise. `push`, `release` and every other event keep the rule that no started job is cancelled, and
+their re-run is refused if a job ran after all. Only first attempts whose
+jobs GitHub lists in full are considered, a repository with a runner that is assigned but has not
+started a job is skipped, and the run is read again right before the cancellation. Cancelling starts the
+run's jobs with `if: always()` or `if: cancelled()`. A newer run of the same workflow and branch refuses
+the re-run, which is then logged as a warning. Each run is cancelled at most once per controller lifetime
+and at most five per cycle, and each re-run is logged as
+`rerouted <repository> run <id>: <n> jobs waited <s> s, discarded <k> running jobs`. A re-run attempt
+shows the App as its triggering actor. Reroute needs the App permission Actions: Read and write; without
+it the controller logs one warning and stops rerouting until it restarts, and `pve-ci-runners doctor`
+fails its `reroute permission` check. Set `reroute_after_seconds = 0` to turn it off.
 
 ## Commands
 

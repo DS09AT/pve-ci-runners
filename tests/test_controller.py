@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from pve_ci_runners.actions import QueuedJob
+from pve_ci_runners.actions import QueuedJob, RunSummary
 from pve_ci_runners.cache import cache_key
 from pve_ci_runners.capacity import HostMemory
 from pve_ci_runners.config import Config, parse
@@ -1405,7 +1405,7 @@ def rerouting(
     return ctl
 
 
-STALLED = QueuedJob(frozenset({"self-hosted", "pve-ci"}), 800.0, 7, True)
+STALLED = QueuedJob(frozenset({"self-hosted", "pve-ci"}), 800.0, 7, RunSummary(True, "push", True))
 
 
 def test_a_burst_bound_to_the_pool_is_re_run_once_overflow_is_on(setup, caplog) -> None:
@@ -1425,7 +1425,7 @@ def test_a_burst_bound_to_the_pool_is_re_run_once_overflow_is_on(setup, caplog) 
     clock.now += 15
     ctl.cycle()
     assert github.reruns == [7]
-    assert "rerouted example-org/app run 7: 4 jobs waited 215 s" in caplog.text
+    assert "rerouted example-org/app run 7: 4 jobs waited 215 s, discarded 0 running jobs" in caplog.text
 
 
 def test_a_repository_whose_warm_vm_is_assigned_in_the_same_cycle_is_not_rerouted(setup) -> None:
