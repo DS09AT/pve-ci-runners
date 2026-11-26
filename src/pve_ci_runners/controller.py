@@ -6,7 +6,8 @@ Nothing is remembered between cycles that the host does not hold itself.
 import collections
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -29,6 +30,9 @@ from pve_ci_runners.templates import current_template, reserved_build_vms
 
 _REPOSITORY_REFRESH = 600
 _MAINTENANCE_INTERVAL = 3600
+# GitHub answers each request in a fraction of a second, so most of a serial read is waiting; this many
+# repositories are read at once.
+_READERS = 8
 log = logging.getLogger("pve_ci_runners")
 
 
@@ -79,28 +83,44 @@ class Controller:
         # Counted in memory only: after a restart a broken guest just fails its checks once more.
         self._failures: dict[int, int] = {}
         self._disk_room = 0
+        self._reader: Executor = ThreadPoolExecutor(_READERS, thread_name_prefix="github")
         self.blocked: str | None = None
+        # How long each phase of the last completed cycle took, for the operator's slow-cycle warning.
+        self.phases = ""
 
     def cycle(self) -> None:
         """Finishes what is done, plans, and starts what is needed."""
         now = self._clock()
+        self.phases = ""
+        laps = _Laps()
         repositories = self._served_repositories(now)
         infos = self._pve.vms()
         found = self._states(infos)
+        laps.lap("states")
         states = self._advance(found, repositories, now)
         if len(states) < len(found):
             # A VM removed just now frees its slot and its memory for a start in this same cycle.
             infos = self._pve.vms()
         states = self._make_disk_room(states, repositories)
+        laps.lap("advance")
         demand = self._demand(repositories, now)
+        laps.lap("demand")
         busy = self._busy({s.repository for s in states.values() if s.repository})
+        laps.lap("busy")
         plans = self._plan(states, infos, demand, busy=busy, now=now)
+        laps.lap("plan")
         self._reroute_runs(states, plans, demand, now)
+        laps.lap("reroute")
         self._apply(plans, states, infos)
+        laps.lap("apply")
         self._update_overflow(plans, demand, now)
+        laps.lap("overflow")
         if now - self._maintained_at >= _MAINTENANCE_INTERVAL:
             self._maintain(states)
             self._maintained_at = now
+            laps.lap("maintenance")
+        self.phases = str(laps)
+        log.debug("cycle phases: %s", self.phases)
 
     def attach_pending(self) -> None:
         """Gives started jobs their cache between polls; a job waits for it before its first step."""
@@ -264,15 +284,26 @@ class Controller:
 
     def _demand(self, repositories: dict[str, str], now: float) -> _Demand:
         demand = _Demand()
-        for repository in repositories:
-            try:
-                jobs = self._github.queued_jobs(repository)
-            except PveCiError as err:
-                log.warning("%s: queued jobs unknown: %s", repository, err)
-                continue
+        for repository, jobs in self._read_each(
+            self._github.queued_jobs, repositories, "queued jobs"
+        ).items():
             demand.jobs[repository] = jobs
             self._count(demand, repository, jobs, now)
         return demand
+
+    def _read_each[T](self, read: Callable[[str], T], repositories: Iterable[str], what: str) -> dict[str, T]:
+        """Reads the repositories in parallel, at most _READERS at once, in the given order.
+
+        One that fails is logged and left out.
+        """
+        names = list(repositories)
+        found: dict[str, T] = {}
+        for repository, result in zip(names, self._reader.map(partial(_attempt, read), names), strict=True):
+            if isinstance(result, PveCiError):
+                log.warning("%s: %s unknown: %s", repository, what, result)
+            else:
+                found[repository] = result
+        return found
 
     def _count(self, demand: _Demand, repository: str, jobs: list[QueuedJob], now: float) -> None:
         for job in jobs:
@@ -284,13 +315,8 @@ class Controller:
             oldest[repository] = min(oldest.get(repository, now), job.created_at)
 
     def _busy(self, repositories: set[str]) -> frozenset[str]:
-        busy: set[str] = set()
-        for repository in repositories:
-            try:
-                busy |= self._github.busy_runners(repository)
-            except PveCiError as err:
-                log.warning("%s: busy runners unknown: %s", repository, err)
-        return frozenset(busy)
+        found = self._read_each(self._github.busy_runners, sorted(repositories), "busy runners")
+        return frozenset().union(*found.values())
 
     def _make_disk_room(self, states: dict[int, VmState], repositories: dict[str, str]) -> dict[int, VmState]:
         """Sets how many more VMs the disk takes, after freeing caches and then idle VMs if it is short.
@@ -473,6 +499,31 @@ class Controller:
 
     def _description(self, vmid: int) -> str:
         return str(self._pve.config(vmid).get("description", ""))
+
+
+class _Laps:
+    """How long each phase of one cycle took, for the debug line and the slow-cycle warning."""
+
+    def __init__(self) -> None:
+        self._last = time.monotonic()
+        self._laps: list[str] = []
+
+    def lap(self, phase: str) -> None:
+        """Ends the phase that ran since the last lap."""
+        now = time.monotonic()
+        self._laps.append(f"{phase} {now - self._last:.1f} s")
+        self._last = now
+
+    def __str__(self) -> str:
+        return ", ".join(self._laps)
+
+
+def _attempt[T](read: Callable[[str], T], repository: str) -> T | PveCiError:
+    # An expected failure travels back as a value, so it stays with its repository.
+    try:
+        return read(repository)
+    except PveCiError as err:
+        return err
 
 
 def _guarded(vmid: int, action: Callable[[], object]) -> bool:

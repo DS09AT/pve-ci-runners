@@ -229,19 +229,46 @@ def test_a_failed_round_is_logged_and_does_not_stop_the_controller(
     assert [r.getMessage().split("\n")[0] for r in caplog.records] == logged
 
 
-@pytest.mark.parametrize(("took", "warned"), [(3.0, False), (15.0, False), (15.5, True)])
-def test_the_cycle_duration_is_logged_and_a_slow_cycle_warned_about(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, took: float, warned: bool
+class Quick:
+    def __init__(self) -> None:
+        self.phases = ""
+        self.runs = 0
+
+    def cycle(self) -> None:
+        self.runs += 1
+        self.phases = f"states 1.0 s, demand {self.runs}.0 s" if self.runs > 1 else ""
+
+
+def test_the_cycle_duration_is_logged_and_a_slow_cycle_warned_about_at_most_every_ten_minutes(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="pve_ci_runners")
-    clock = iter([100.0, 100.0 + took])
+    # Start and end of each cycle: 3 s, 15 s, 15.5 s, 20 s nine minutes later, 16 s ten minutes later.
+    clock = iter([0.0, 3.0, 10.0, 25.0, 30.0, 45.5, 570.0, 590.0, 630.0, 646.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+    timer = cli._CycleTimer(15)
+    controller = Quick()
+
+    for _ in range(5):
+        timer.run(controller)  # type: ignore[arg-type]
+
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert debug == [f"cycle took {t} s" for t in ("3.0", "15.0", "15.5", "20.0", "16.0")]
+    assert warnings == [
+        "cycle took 15.5 s, longer than daemon.poll_seconds (15 s): states 1.0 s, demand 3.0 s",
+        "cycle took 16.0 s, longer than daemon.poll_seconds (15 s): states 1.0 s, demand 5.0 s",
+    ]
+
+
+def test_a_slow_cycle_that_failed_before_its_phases_were_known_is_warned_about_without_them(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([0.0, 20.0])
     monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
 
-    class Quick:
-        def cycle(self) -> None:
-            pass
+    cli._CycleTimer(15).run(Quick())  # type: ignore[arg-type]
 
-    cli._timed_cycle(Quick(), 15)  # type: ignore[arg-type]
-
-    assert f"cycle took {took:.1f} s" in caplog.text
-    assert any(r.levelno == logging.WARNING for r in caplog.records) is warned
+    assert [r.getMessage() for r in caplog.records] == [
+        "cycle took 20.0 s, longer than daemon.poll_seconds (15 s)"
+    ]

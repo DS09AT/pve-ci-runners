@@ -9,6 +9,7 @@ rate limit.
 import base64
 import datetime as dt
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -132,6 +133,9 @@ class GitHubClient:
     _expires: float = field(default=0.0, init=False)
     _permissions: dict[str, str] = field(default_factory=dict[str, str], init=False)
     _cache: dict[str, _Cached] = field(default_factory=dict[str, _Cached], init=False, repr=False)
+    # The controller reads several repositories at once; the token and the ETag cache are shared.
+    _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def get(self, path: str, *, conditional: bool = False) -> object:
         """A GET that is retried on server errors; conditional GETs reuse the last answer on 304."""
@@ -167,7 +171,8 @@ class GitHubClient:
             "User-Agent": f"pve-ci-runners/{VERSION}",
             "Authorization": f"Bearer {auth or self._installation_token()}",
         }
-        cached = self._cache.get(path) if conditional else None
+        with self._cache_lock:
+            cached = self._cache.get(path) if conditional else None
         if cached is not None:
             headers["If-None-Match"] = cached.etag
         data = json.dumps(body).encode() if body is not None else None
@@ -187,12 +192,18 @@ class GitHubClient:
         payload: object = json.loads(answer.body) if answer.body.strip() else None
         etag = answer.headers.get("ETag") or answer.headers.get("etag")
         if conditional and etag:
-            self._cache[path] = _Cached(etag, payload)
+            with self._cache_lock:
+                self._cache[path] = _Cached(etag, payload)
         return payload
 
     def _installation_token(self) -> str:
-        if self.clock() < self._expires - _TOKEN_MARGIN:
-            return self._token
+        # One refresh at a time: the others wait for it instead of each asking GitHub for a token.
+        with self._token_lock:
+            if self.clock() < self._expires - _TOKEN_MARGIN:
+                return self._token
+            return self._refreshed_token()
+
+    def _refreshed_token(self) -> str:
         jwt = self._jwt()
         installations = self._once("GET", "/app/installations", None, conditional=False, auth=jwt)
         ids = [i.get("id") for i in _dicts(installations) if _login(i.get("account")) == self.owner.lower()]
@@ -216,7 +227,8 @@ class GitHubClient:
     def permissions(self) -> dict[str, str]:
         """What the installation token may do, as GitHub granted it."""
         self._installation_token()
-        return dict(self._permissions)
+        with self._token_lock:
+            return dict(self._permissions)
 
     def _jwt(self) -> str:
         now = int(self.clock())
