@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The entries up to 0.2.0
 automated release management ([release-please](https://github.com/googleapis/release-please)) was adopted;
 every later entry is generated from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.10.5](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.4...v0.10.5) (2026-11-26)
+
+
+### Bug Fixes
+
+* run the per-slot steps of a cycle in parallel ([4e6ed5e](https://github.com/DS09AT/pve-ci-runners/commit/4e6ed5ee38bbe0f54e83c1f18dcce273b23d317d))
+
 ## [0.10.4](https://github.com/DS09AT/pve-ci-runners/compare/v0.10.3...v0.10.4) (2026-11-26)
 
 
